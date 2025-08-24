@@ -1,0 +1,419 @@
+/**
+ * @file camera_config.c
+ * @brief C层相机配置管理模块
+ * 
+ * 职责：
+ * 1. 从配置文件读取配置到内存结构体 (如果没有配置文件则使用默认值)
+ * 2. 将内存结构体中的配置参数应用到相机硬件
+ * 3. 提供配置参数的查询接口
+ * 
+ * 不负责：
+ * - 配置文件的写入 (由Rust层 src-tauri/src/config/config_manager.rs 负责)
+ * - 前端配置界面 (由业务层负责)
+ * - 配置文件格式定义 (由Rust层定义)
+ * 
+ * 设计原则：
+ * - 配置文件 → 内存结构体 → 硬件参数 (单向数据流)
+ * - 内存结构体作为配置的唯一数据源
+ * - 支持热重载：重新读取配置文件更新内存结构体
+ * 
+ * @version 2.0
+ * @date 2025/01/15
+ * @author Camera Configuration Expert (重构版)
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+//#include <stdlib.h>
+#include "MvCameraControl.h"
+#include "MvErrorDefine.h"
+#include "CameraParams.h"
+#include "MvISPErrorDefine.h"
+#include "MvSdkExport.h"
+#include "PixelType.h"
+#include "camera_api.h"
+
+// 定义bool类型，避免与海康SDK头文件冲突
+#ifndef bool
+#define bool int
+#define true 1
+#define false 0
+#endif
+
+// ==================== 配置参数结构 ====================
+
+// ROI区域配置
+typedef struct {
+    int32_t offset_x;              // ROI X方向偏移量
+    int32_t offset_y;              // ROI Y方向偏移量  
+    int32_t width;                 // ROI宽度
+    int32_t height;                // ROI高度
+    bool enabled;                  // 是否启用ROI
+    bool applies_to_both_cameras;  // 是否对左右相机都生效
+} RoiConfig;
+
+// 统一的相机硬件参数配置
+typedef struct {
+    uint32_t frame_rate;           // 帧率 (fps) - 连续模式使用
+    uint32_t exposure_time;        // 曝光时间 (微秒) - 所有模式统一
+    float gain;                    // 增益 - 所有模式统一
+    bool frame_rate_enable;        // 帧率控制使能
+    bool auto_exposure;            // 自动曝光
+    bool auto_gain;                // 自动增益
+    
+    // 相机序列号配置
+    char left_camera_serial[32];   // 左相机序列号
+    char right_camera_serial[32];  // 右相机序列号
+    
+    // ROI区域配置
+    RoiConfig roi;                 // ROI区域设置
+} CommonCameraParams;
+
+// 全局配置状态 - 内存中的配置数据源
+static struct {
+    bool initialized;                      // 是否已初始化
+    bool config_loaded;                    // 是否已从文件加载配置
+    CommonCameraParams camera_params;      // 统一的相机硬件参数 (核心数据源)
+    char last_config_file[256];            // 最后加载的配置文件路径
+    uint64_t config_version;               // 配置版本号 (用于检测更新)
+} g_config = {
+    .initialized = false,
+    .config_loaded = false,
+    .last_config_file = {0},
+    .config_version = 0
+};
+
+// ==================== 内部辅助函数 ====================
+
+/**
+ * @brief 初始化默认配置参数到内存结构体
+ */
+static void load_default_configs() {
+    const char* func_name = "load_default_configs";
+    
+    printf("INFO %s: 加载默认配置参数到内存结构体...\n", func_name);
+    
+    // 统一的相机硬件参数 (所有模式共用)
+    g_config.camera_params = (CommonCameraParams){
+        .frame_rate = 15,          // 15fps - 适合合像模式的67ms间隔，满足60ms处理需求
+        .exposure_time = 10000,    // 10ms - 平衡的曝光时间，适合所有模式
+        .gain = 0.0f,              // 0增益 - 根据您的设置
+        .frame_rate_enable = true, // 连续模式启用帧率控制
+        .auto_exposure = false,    // 手动曝光控制
+        .auto_gain = false,        // 手动增益控制
+        
+        // 相机序列号配置 (从Rust层camera_config.rs获取)
+        .left_camera_serial = "DA5158733",   // 左相机序列号
+        .right_camera_serial = "DA5158736",  // 右相机序列号
+        
+        // ROI区域配置 (默认全图，与Rust层保持一致)
+        .roi = {
+            .offset_x = 0,                   // 默认从0开始
+            .offset_y = 0,                   // 默认从0开始
+            .width = 2448,                   // 默认全图宽度
+            .height = 2048,                  // 默认全图高度
+            .enabled = false,                // 默认不启用ROI
+            .applies_to_both_cameras = true  // 默认对两个相机都生效
+        }
+    };
+    
+    g_config.initialized = true;
+    g_config.config_loaded = false; // 使用默认配置，未从文件加载
+    g_config.config_version++;
+    
+    printf("INFO %s: 默认配置加载完成 (版本: %llu)\n", func_name, g_config.config_version);
+    printf("INFO %s: 统一相机参数:\n", func_name);
+    printf("INFO %s:    - 帧率: %d fps (连续模式使用)\n", func_name, g_config.camera_params.frame_rate);
+    printf("INFO %s:    - 曝光: %d ms (所有模式统一)\n", func_name, g_config.camera_params.exposure_time / 1000);
+    printf("INFO %s:    - 增益: %.1f (所有模式统一)\n", func_name, g_config.camera_params.gain);
+    printf("INFO %s: 相机序列号配置:\n", func_name);
+    printf("INFO %s:    - 左相机: %s\n", func_name, g_config.camera_params.left_camera_serial);
+    printf("INFO %s:    - 右相机: %s\n", func_name, g_config.camera_params.right_camera_serial);
+    printf("INFO %s: ROI区域配置:\n", func_name);
+    printf("INFO %s:    - 启用状态: %s\n", func_name, g_config.camera_params.roi.enabled ? "启用" : "禁用");
+    if (g_config.camera_params.roi.enabled) {
+        printf("INFO %s:    - 区域: (%d,%d) %dx%d\n", func_name, g_config.camera_params.roi.offset_x, g_config.camera_params.roi.offset_y, g_config.camera_params.roi.width, g_config.camera_params.roi.height);
+        printf("INFO %s:    - 应用范围: %s\n", func_name, g_config.camera_params.roi.applies_to_both_cameras ? "左右相机" : "单个相机");
+    } else {
+        printf("INFO %s:    - 使用全图: %dx%d\n", func_name, g_config.camera_params.roi.width, g_config.camera_params.roi.height);
+    }
+    printf("INFO %s: 触发模式 (写死配置):\n", func_name);
+    printf("INFO %s:    - 预览模式: 连续采集\n", func_name);
+    printf("INFO %s:    - 检测模式: 软触发\n", func_name);
+    printf("INFO %s:    - 合像模式: 连续采集\n", func_name);
+}
+
+/**
+ * @brief 从配置文件加载配置到内存结构体
+ * TODO: 实现配置文件解析，当前使用默认配置
+ */
+static int load_config_from_file(const char* config_path) {
+    const char* func_name = "load_config_from_file";
+    
+    if (!config_path) {
+        printf("WARN %s: 配置文件路径为空，使用默认配置\n", func_name);
+        load_default_configs();
+        return MV_OK;
+    }
+    
+    printf("INFO %s: 尝试从配置文件加载: %s\n", func_name, config_path);
+    
+    // TODO: 实现实际的配置文件解析
+    // 当前阶段：
+    // 1. 检查文件是否存在
+    // 2. 如果存在，解析JSON/YAML格式
+    // 3. 将解析的值赋给 g_config.stage_configs
+    // 4. 如果文件不存在或解析失败，使用默认配置
+    
+    // 暂时使用默认配置，但标记文件路径
+    load_default_configs();
+    strncpy(g_config.last_config_file, config_path, sizeof(g_config.last_config_file) - 1);
+    
+    printf("WARN %s: 配置文件解析功能待实现，当前使用默认配置\n", func_name);
+    printf("INFO %s: 配置文件路径已记录: %s\n", func_name, config_path);
+    
+    return MV_OK;
+}
+
+/**
+ * @brief 获取指定阶段的触发模式
+ */
+static TriggerMode get_stage_trigger_mode(const char* stage_name) {
+    if (!stage_name) return TRIGGER_OFF;
+    
+    if (strcmp(stage_name, "preview") == 0) {
+        return TRIGGER_OFF; // 预览模式固定为连续采集
+    } else if (strcmp(stage_name, "detection") == 0) {
+        return TRIGGER_SOFTWARE; // 检测模式固定为软触发
+    } else if (strcmp(stage_name, "alignment") == 0) {
+        return TRIGGER_OFF; // 合像模式固定为连续采集
+    }
+    
+    return TRIGGER_OFF; // 默认连续采集
+}
+
+/**
+ * @brief 将内存结构体中的配置应用到相机硬件
+ */
+static int apply_config_to_camera(unsigned int cam_index, const CommonCameraParams* config, TriggerMode trigger_mode) {
+    const char* func_name = "apply_config_to_camera";
+    int ret = MV_OK;
+    
+    if (cam_index >= CAMERA_NUM) {
+        printf("ERROR %s: 无效的相机索引: %d\n", func_name, cam_index);
+        return -1;
+    }
+    
+    if (!cameras[cam_index].opened || !cameras[cam_index].handle) {
+        printf("WARN %s: 相机 %d 未打开，跳过配置应用\n", func_name, cam_index);
+        return MV_OK;
+    }
+    
+    printf("INFO %s: 应用配置到相机 %d (触发模式: %s)...\n", func_name, cam_index, trigger_mode == TRIGGER_OFF ? "连续" : "软触发");
+    
+    // 1. 设置触发模式 (根据阶段决定)
+    ret = camera_set_trigger_mode(cam_index, trigger_mode);
+    if (ret != MV_OK) {
+        printf("ERROR %s: 设置触发模式失败，相机 %d: 0x%x\n", func_name, cam_index, ret);
+        return ret;
+    }
+    
+    // 2. 设置帧率 (仅在连续模式且启用帧率控制时)
+    if (trigger_mode == TRIGGER_OFF && config->frame_rate_enable && config->frame_rate > 0) {
+        ret = camera_set_frame_rate(cam_index, config->frame_rate);
+        if (ret != MV_OK) {
+            printf("WARN %s: 设置帧率失败，相机 %d: 0x%x\n", func_name, cam_index, ret);
+            // 帧率设置失败不影响其他参数
+        } else {
+            printf("INFO %s: 相机 %d 帧率设置: %d fps\n", func_name, cam_index, config->frame_rate);
+        }
+    }
+    
+    // 3. 设置曝光时间 (所有模式统一使用)
+    if (config->exposure_time > 0) {
+        ret = camera_set_exposure_time(cam_index, config->exposure_time);
+        if (ret != MV_OK) {
+            printf("WARN %s: 设置曝光时间失败，相机 %d: 0x%x\n", func_name, cam_index, ret);
+            // 曝光设置失败不影响其他参数
+        } else {
+            printf("INFO %s: 相机 %d 曝光时间设置: %d us\n", func_name, cam_index, config->exposure_time);
+        }
+    }
+    
+    // 4. 设置增益 (所有模式统一使用，如果不是0)
+    if (config->gain != 0.0f) {
+        ret = camera_set_gain(cam_index, config->gain);
+        if (ret != MV_OK) {
+            printf("WARN %s: 设置增益失败，相机 %d: 0x%x\n", func_name, cam_index, ret);
+            // 增益设置失败不影响其他参数
+        } else {
+            printf("INFO %s: 相机 %d 增益设置: %.1f\n", func_name, cam_index, config->gain);
+        }
+    }
+    
+    printf("INFO %s: 相机 %d 配置应用完成\n", func_name, cam_index);
+    return MV_OK;
+}
+
+/**
+ * @brief 获取指定阶段的配置参数 (统一返回相机参数)
+ */
+static const CommonCameraParams* get_stage_config(const char* stage_name) {
+    // 所有阶段都使用相同的相机参数，只有触发模式不同
+    return &g_config.camera_params;
+}
+
+// ==================== 公共API实现 ====================
+
+/**
+ * @brief 从配置文件加载并应用配置 (如果没有配置文件则使用默认配置)
+ * @param config_path 配置文件路径 (可为NULL)
+ * @return 错误码 (0=成功)
+ */
+int camera_config_load_and_apply(const char* config_path) {
+    const char* func_name = "camera_config_load_and_apply";
+    
+    printf("INFO %s: 加载配置: %s\n", func_name, config_path ? config_path : "使用默认配置");
+    
+    // 1. 从配置文件加载到内存结构体 (如果没有文件则使用默认配置)
+    int ret = load_config_from_file(config_path);
+    if (ret != MV_OK) {
+        printf("ERROR %s: 配置加载失败: 0x%x\n", func_name, ret);
+        return ret;
+    }
+    
+    // 2. 应用预览模式作为初始配置
+    ret = camera_config_apply_stage_params("preview");
+    if (ret != MV_OK) {
+        printf("ERROR %s: 应用初始配置失败: 0x%x\n", func_name, ret);
+        return ret;
+    }
+    
+    printf("INFO %s: 配置加载和应用完成\n", func_name);
+    return MV_OK;
+}
+
+/**
+ * @brief 应用工作流程阶段参数 (从内存结构体读取配置)
+ * @param stage_name 阶段名称 ("preview", "detection", "alignment")
+ * @return 错误码 (0=成功)
+ */
+int camera_config_apply_stage_params(const char* stage_name) {
+    const char* func_name = "camera_config_apply_stage_params";
+    
+    if (!stage_name) {
+        printf("ERROR %s: 阶段名称不能为空\n", func_name);
+        return -1;
+    }
+    
+    // 确保配置已初始化
+    if (!g_config.initialized) {
+        printf("WARN %s: 配置未初始化，加载默认配置\n", func_name);
+        load_default_configs();
+    }
+    
+    printf("INFO %s: 应用阶段参数: %s (从内存结构体)\n", func_name, stage_name);
+    
+    // 从内存结构体获取配置
+    const CommonCameraParams* target_config = get_stage_config(stage_name);
+    if (!target_config) {
+        printf("ERROR %s: 未知的阶段名称: %s\n", func_name, stage_name);
+        return -1;
+    }
+    
+    // 获取当前阶段的触发模式
+    TriggerMode current_trigger_mode = get_stage_trigger_mode(stage_name);
+
+    // 应用配置到所有相机
+    int ret = MV_OK;
+    for (unsigned int i = 0; i < CAMERA_NUM; i++) {
+        int cam_ret = apply_config_to_camera(i, target_config, current_trigger_mode);
+        if (cam_ret != MV_OK) {
+            printf("ERROR %s: 相机 %d 配置应用失败: 0x%x\n", func_name, i, cam_ret);
+            ret = cam_ret; // 记录错误，但继续配置其他相机
+        }
+    }
+    
+    if (ret == MV_OK) {
+        printf("INFO %s: 阶段 %s 配置应用完成\n", func_name, stage_name);
+    } else {
+        printf("WARN %s: 阶段 %s 配置应用部分失败\n", func_name, stage_name);
+    }
+    
+    return ret;
+}
+
+/**
+ * @brief 重新加载配置文件 (热重载)
+ * @param config_path 配置文件路径 (可为NULL表示重载上次的文件)
+ * @return 错误码 (0=成功)
+ */
+int camera_config_reload(const char* config_path) {
+    const char* func_name = "camera_config_reload";
+    
+    const char* target_path = config_path ? config_path : g_config.last_config_file;
+    
+    printf("INFO %s: 重新加载配置文件: %s\n", func_name, target_path);
+    
+    // 重新从文件加载到内存结构体
+    int ret = load_config_from_file(target_path);
+    if (ret != MV_OK) {
+        printf("ERROR %s: 配置重载失败: 0x%x\n", func_name, ret);
+        return ret;
+    }
+    
+    printf("INFO %s: 配置重载完成，需要重新应用阶段参数\n", func_name);
+    return MV_OK;
+}
+
+/**
+ * @brief 获取当前配置信息 (从内存结构体读取)
+ * @return 配置信息字符串
+ */
+const char* camera_config_get_info() {
+    static char info_buffer[2048]; // 增大缓冲区以容纳更多信息
+    
+    if (!g_config.initialized) {
+        snprintf(info_buffer, sizeof(info_buffer), "配置系统未初始化");
+        return info_buffer;
+    }
+    
+    snprintf(info_buffer, sizeof(info_buffer),
+             "相机配置信息 (内存结构体):\n"
+             "- 配置状态: %s (版本: %llu)\n"
+             "- 配置文件: %s\n"
+             "统一相机参数:\n"
+             "   - 帧率: %d fps\n"
+             "   - 曝光时间: %d us\n"
+             "   - 增益: %.1f\n"
+             "   - 帧率控制: %s\n"
+             "相机序列号:\n"
+             "   - 左相机: %s\n"
+             "   - 右相机: %s\n"
+             "ROI区域:\n"
+             "   - 启用: %s\n"
+             "   - 区域: (%d,%d) %dx%d\n"
+             "   - 应用范围: %s\n"
+             "触发模式 (写死):\n"
+             "   - 预览模式: 连续采集\n"
+             "   - 检测模式: 软触发\n"
+             "   - 合像模式: 连续采集\n",
+             g_config.config_loaded ? "从文件加载" : "使用默认配置",
+             g_config.config_version,
+             g_config.last_config_file[0] ? g_config.last_config_file : "无",
+             g_config.camera_params.frame_rate,
+             g_config.camera_params.exposure_time,
+             g_config.camera_params.gain,
+             g_config.camera_params.frame_rate_enable ? "启用" : "禁用",
+             g_config.camera_params.left_camera_serial,
+             g_config.camera_params.right_camera_serial,
+             g_config.camera_params.roi.enabled ? "启用" : "禁用",
+             g_config.camera_params.roi.offset_x,
+             g_config.camera_params.roi.offset_y,
+             g_config.camera_params.roi.width,
+             g_config.camera_params.roi.height,
+             g_config.camera_params.roi.applies_to_both_cameras ? "左右相机" : "单个相机");
+    
+    return info_buffer;
+} 
