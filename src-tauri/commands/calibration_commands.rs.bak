@@ -1,0 +1,267 @@
+//! 标定工作流程 Tauri 命令接口
+//! 
+//! 为前端提供完整的标定工作流程调用接口，包括：
+//! - 标定状态检测和管理
+//! - 标定图像采集工作流
+//! - 标定算法流程控制  
+//! - 标定结果验证和保存
+
+use std::sync::{Arc, Mutex};
+use tauri::State;
+use crate::{
+    config::SystemConfig,
+    modules::calibration_workflow::{
+        CalibrationWorkflow, CalibrationStatus, CalibrationFiles, 
+        ImagePair, CalibrationProgress, CalibrationResult,
+        CalibrationError, UserGuidance, CaptureSession,
+    },
+};
+
+/// 全局标定工作流程管理器状态
+pub struct CalibrationWorkflowState {
+    pub workflow: Arc<Mutex<Option<CalibrationWorkflow>>>,
+}
+
+impl CalibrationWorkflowState {
+    pub fn new() -> Self {
+        Self {
+            workflow: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// 初始化标定工作流程管理器
+#[tauri::command]
+pub async fn initialize_calibration_workflow(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<(), String> {
+    println!("🏗️ 初始化标定工作流程管理器...");
+    
+    // 使用默认配置创建工作流程
+    let system_config = SystemConfig::new();
+    let workflow = CalibrationWorkflow::new(system_config)
+        .map_err(|e| format!("初始化标定工作流程失败: {}", e))?;
+    
+    let mut state_guard = state.workflow.lock().unwrap();
+    *state_guard = Some(workflow);
+    
+    println!("✅ 标定工作流程管理器初始化完成");
+    Ok(())
+}
+
+/// 获取当前标定状态
+#[tauri::command]
+pub async fn get_calibration_status(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<CalibrationStatus, String> {
+    let state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_ref()
+        .ok_or("标定工作流程未初始化")?;
+    
+    Ok(workflow.get_calibration_status())
+}
+
+/// 获取标定文件信息
+#[tauri::command]
+pub async fn get_calibration_files_info(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<CalibrationFiles, String> {
+    let state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_ref()
+        .ok_or("标定工作流程未初始化")?;
+    
+    Ok(workflow.get_calibration_files_info())
+}
+
+/// 重新检测标定状态
+#[tauri::command]
+pub async fn refresh_calibration_status(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<CalibrationStatus, String> {
+    let mut state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_mut()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.detect_calibration_status()
+}
+
+/// 开始标定图像采集会话
+#[tauri::command]
+pub async fn start_calibration_capture(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<String, String> {
+    let mut state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_mut()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.start_calibration_capture()
+}
+
+/// 拍摄一组标定图像
+/// 由于camera_manager.rs重构测试,暂时跳过该函数
+// #[tauri::command]
+// pub async fn capture_calibration_image(
+//     state: State<'_, CalibrationWorkflowState>,
+// ) -> Result<ImagePair, String> {
+//     let mut state_guard = state.workflow.lock().unwrap();
+//     let workflow = state_guard.as_mut()
+//         .ok_or("标定工作流程未初始化")?;
+    
+//     workflow.capture_calibration_image()
+// }
+
+/// 获取已采集的图像列表
+#[tauri::command]
+pub async fn get_captured_images(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<Vec<ImagePair>, String> {
+    let state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_ref()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.get_captured_images()
+}
+
+/// 删除指定的图像对
+#[tauri::command]
+pub async fn delete_captured_image(
+    state: State<'_, CalibrationWorkflowState>,
+    pair_id: u32,
+) -> Result<(), String> {
+    let mut state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_mut()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.delete_captured_image(pair_id)
+}
+
+/// 完成图像采集，检查是否满足标定要求
+#[tauri::command]
+pub async fn finish_image_capture(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<bool, String> {
+    let mut state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_mut()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.finish_image_capture()
+}
+
+/// 开始标定计算流程
+#[tauri::command]
+pub async fn start_calibration_process(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<(), String> {
+    let mut state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_mut()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.start_calibration_process()
+}
+
+/// 获取当前标定进度
+#[tauri::command]
+pub async fn get_calibration_progress(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<CalibrationProgress, String> {
+    let state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_ref()
+        .ok_or("标定工作流程未初始化")?;
+    
+    Ok(workflow.get_calibration_progress())
+}
+
+/// 获取标定结果
+#[tauri::command]
+pub async fn get_calibration_result(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<Option<CalibrationResult>, String> {
+    let state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_ref()
+        .ok_or("标定工作流程未初始化")?;
+    
+    Ok(workflow.get_calibration_result())
+}
+
+/// 取消标定流程
+#[tauri::command]
+pub async fn cancel_calibration(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<(), String> {
+    let mut state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_mut()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.cancel_calibration()
+}
+
+/// 获取标定错误的用户指导
+#[tauri::command]
+pub async fn get_calibration_error_guidance(
+    state: State<'_, CalibrationWorkflowState>,
+    error_type: String,
+) -> Result<UserGuidance, String> {
+    let state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_ref()
+        .ok_or("标定工作流程未初始化")?;
+    
+    // 解析错误类型
+    let error = match error_type.as_str() {
+        "insufficient_images" => CalibrationError::InsufficientImages,
+        "feature_detection_failed" => CalibrationError::FeatureDetectionFailed,
+        "calibration_failed" => CalibrationError::CalibrationFailed,
+        "high_reprojection_error" => CalibrationError::HighReprojectionError,
+        "file_system_error" => CalibrationError::FileSystemError,
+        "configuration_error" => CalibrationError::ConfigurationError,
+        "camera_error" => CalibrationError::CameraError,
+        _ => return Err("未知的错误类型".to_string()),
+    };
+    
+    Ok(workflow.handle_calibration_error(error))
+}
+
+/// 获取采集会话信息
+#[tauri::command]
+pub async fn get_capture_session_info(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<Option<CaptureSession>, String> {
+    let state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_ref()
+        .ok_or("标定工作流程未初始化")?;
+    
+    // 这里需要在CalibrationWorkflow中添加获取会话信息的方法
+    // 暂时返回None
+    Ok(None)
+}
+
+/// 重置标定工作流程
+#[tauri::command]
+pub async fn reset_calibration_workflow(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<(), String> {
+    println!("🔄 重置标定工作流程...");
+    
+    let mut state_guard = state.workflow.lock().unwrap();
+    
+    // 重新创建工作流程
+    let system_config = SystemConfig::new();
+    let workflow = CalibrationWorkflow::new(system_config)
+        .map_err(|e| format!("重置标定工作流程失败: {}", e))?;
+    
+    *state_guard = Some(workflow);
+    
+    println!("✅ 标定工作流程已重置");
+    Ok(())
+}
+
+/// 完成整个标定工作流程并释放资源
+#[tauri::command]
+pub async fn finish_calibration_workflow(
+    state: State<'_, CalibrationWorkflowState>,
+) -> Result<(), String> {
+    let mut state_guard = state.workflow.lock().unwrap();
+    let workflow = state_guard.as_mut()
+        .ok_or("标定工作流程未初始化")?;
+    
+    workflow.finish_calibration_workflow()
+} 

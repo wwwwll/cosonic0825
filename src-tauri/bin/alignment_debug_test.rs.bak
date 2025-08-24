@@ -1,0 +1,492 @@
+// alignment_debug_test.rs - 合像检测调试测试程序
+// 专门用于调试圆点检测问题，使用本地保存的图像进行离线测试
+
+use std::time::Instant;
+use std::path::Path;
+use opencv::{core, imgcodecs, imgproc, prelude::*};
+use merging_image_lib::modules::alignment::AlignmentSystem;
+use opencv::core::AlgorithmHint;
+
+/// 合像检测调试测试器
+pub struct AlignmentDebugTest {
+    alignment_system: Option<AlignmentSystem>,
+    test_image_left: core::Mat,
+    test_image_right: core::Mat,
+    rectify_maps_path: String,
+}
+
+impl AlignmentDebugTest {
+    /// 创建调试测试器实例
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        println!("🔧 初始化合像检测调试测试器...");
+        
+        // 确定正确的文件路径
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path.parent().unwrap();
+        let src_tauri_dir = exe_dir.parent().unwrap().parent().unwrap();
+        
+        println!("📍 项目根目录: {:?}", src_tauri_dir);
+        
+        // 构造绝对路径
+        let img_path_left = src_tauri_dir.join("src/tests/data/benchmark/left_calibration.bmp");
+        let img_path_right = src_tauri_dir.join("src/tests/data/benchmark/right_calibration.bmp");
+        // 🔧 修正重映射矩阵路径 - 使用yaml_last_param_file目录
+        let rectify_maps = src_tauri_dir.join("yaml_last_param_file/rectify_maps.yaml");
+        
+        // 验证文件存在
+        if !img_path_left.exists() {
+            return Err(format!("左图像文件不存在: {:?}", img_path_left).into());
+        }
+        if !img_path_right.exists() {
+            return Err(format!("右图像文件不存在: {:?}", img_path_right).into());
+        }
+        if !rectify_maps.exists() {
+            return Err(format!("重映射文件不存在: {:?}", rectify_maps).into());
+        }
+        
+        // 加载测试图像
+        println!("📁 加载测试图像...");
+        println!("   左图像: {:?}", img_path_left);
+        println!("   右图像: {:?}", img_path_right);
+        
+        let test_image_left = imgcodecs::imread(
+            img_path_left.to_str().unwrap(),
+            imgcodecs::IMREAD_GRAYSCALE
+        )?;
+        
+        let test_image_right = imgcodecs::imread(
+            img_path_right.to_str().unwrap(),
+            imgcodecs::IMREAD_GRAYSCALE
+        )?;
+        
+        if test_image_left.empty() || test_image_right.empty() {
+            return Err("无法加载测试图像，请检查文件格式".into());
+        }
+        
+        let image_size = test_image_left.size()?;
+        println!("✓ 测试图像加载成功: {}×{}", image_size.width, image_size.height);
+        
+        // 打印图像基本信息
+        println!("📊 图像信息:");
+        println!("   左图: 尺寸={}×{}, 类型={}, 通道={}", 
+                test_image_left.cols(), test_image_left.rows(), 
+                test_image_left.typ(), test_image_left.channels());
+        println!("   右图: 尺寸={}×{}, 类型={}, 通道={}", 
+                test_image_right.cols(), test_image_right.rows(), 
+                test_image_right.typ(), test_image_right.channels());
+        
+        // 检查图像灰度范围
+        let mut min_val = 0.0;
+        let mut max_val = 0.0;
+        core::min_max_loc(
+            &test_image_left,
+            Some(&mut min_val),
+            Some(&mut max_val),
+            None,
+            None,
+            &core::no_array(),
+        )?;
+        println!("   左图灰度范围: [{:.0}, {:.0}]", min_val, max_val);
+        
+        core::min_max_loc(
+            &test_image_right,
+            Some(&mut min_val),
+            Some(&mut max_val),
+            None,
+            None,
+            &core::no_array(),
+        )?;
+        println!("   右图灰度范围: [{:.0}, {:.0}]", min_val, max_val);
+        
+        Ok(Self {
+            alignment_system: None,
+            test_image_left,
+            test_image_right,
+            rectify_maps_path: rectify_maps.to_string_lossy().to_string(),
+        })
+    }
+    
+    /// 初始化合像检测系统
+    fn init_alignment_system(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.alignment_system.is_some() {
+            return Ok(());
+        }
+        
+        println!("🚀 初始化合像检测系统...");
+        
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path.parent().unwrap();
+        let src_tauri_dir = exe_dir.parent().unwrap().parent().unwrap();
+        
+        // 🔧 修正参数文件路径 - 使用yaml_last_param_file目录
+        // 旧路径 (注释掉):
+        // let left_cam_params = src_tauri_dir.join("left_camera_params.yaml");
+        // let right_cam_params = src_tauri_dir.join("right_camera_params.yaml");
+        // let stereo_params = src_tauri_dir.join("stereo_params.yaml");
+        // let rectify_params = src_tauri_dir.join("rectify_params.yaml");
+        
+        let left_cam_params = src_tauri_dir.join("yaml_last_param_file/left_camera_params.yaml");
+        let right_cam_params = src_tauri_dir.join("yaml_last_param_file/right_camera_params.yaml");
+        let stereo_params = src_tauri_dir.join("yaml_last_param_file/stereo_params.yaml");
+        let rectify_params = src_tauri_dir.join("yaml_last_param_file/rectify_params.yaml");
+        
+        // 检查标定文件是否存在
+        let required_files = [
+            ("左相机参数", &left_cam_params),
+            ("右相机参数", &right_cam_params),
+            ("双目参数", &stereo_params),
+            ("校正参数", &rectify_params),
+        ];
+        
+        for (name, path) in &required_files {
+            if !path.exists() {
+                return Err(format!("{}文件不存在: {:?}", name, path).into());
+            }
+            println!("   ✓ {}: {:?}", name, path);
+        }
+        
+        let image_size = self.test_image_left.size()?;
+        
+        // 使用预加载版本创建系统
+        let alignment_system = AlignmentSystem::new_with_preload(
+            image_size,
+            left_cam_params.to_str().unwrap(),
+            right_cam_params.to_str().unwrap(),
+            stereo_params.to_str().unwrap(),
+            rectify_params.to_str().unwrap(),
+            &self.rectify_maps_path,
+        )?;
+        
+        self.alignment_system = Some(alignment_system);
+        println!("✓ 合像检测系统初始化完成");
+        
+        Ok(())
+    }
+    
+    /// 运行所有调试测试
+    pub fn run_debug_tests(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("\n🚀 开始合像检测调试测试");
+        println!("{}", "=".repeat(60));
+        
+        // 1. 测试图像基本信息
+        self.test_image_info()?;
+        
+        // 2. 初始化系统
+        self.init_alignment_system()?;
+        
+        // 3. 测试圆点检测
+        self.test_circle_detection()?;
+        
+        // 4. 测试完整检测流程
+        self.test_complete_alignment()?;
+        
+        // 5. 保存调试图像
+        self.save_debug_images()?;
+        
+        println!("\n🎉 调试测试完成");
+        Ok(())
+    }
+    
+    /// 测试图像基本信息
+    fn test_image_info(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("\n📊 测试1: 图像基本信息分析");
+        println!("{}", "-".repeat(40));
+        
+        // 保存原始图像副本用于分析
+        imgcodecs::imwrite("debug_left_original.png", &self.test_image_left, &core::Vector::<i32>::new())?;
+        imgcodecs::imwrite("debug_right_original.png", &self.test_image_right, &core::Vector::<i32>::new())?;
+        println!("✓ 已保存原始图像: debug_left_original.png, debug_right_original.png");
+        
+        // 跳过复杂的直方图计算，专注于圆点检测调试
+        println!("✓ 图像基本信息分析完成");
+        
+        // 检查图像是否有足够的对比度
+        let mut mean_val = core::Scalar::default();
+        let mut std_dev = core::Scalar::default();
+        core::mean_std_dev(&self.test_image_left, &mut mean_val, &mut std_dev, &core::no_array())?;
+        
+        println!("📈 左图像统计:");
+        println!("   平均值: {:.2}", mean_val[0]);
+        println!("   标准差: {:.2}", std_dev[0]);
+        
+        if std_dev[0] < 20.0 {
+            println!("⚠️ 警告: 图像对比度较低 (标准差={:.2}), 可能影响圆点检测", std_dev[0]);
+        } else {
+            println!("✓ 图像对比度良好 (标准差={:.2})", std_dev[0]);
+        }
+        
+        Ok(())
+    }
+    
+    /// 测试圆点检测
+    fn test_circle_detection(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("\n🔍 测试2: 圆点检测测试");
+        println!("{}", "-".repeat(40));
+        
+        let alignment_system = self.alignment_system.as_mut().unwrap();
+        
+        // 测试圆点检测
+        let start_time = Instant::now();
+        let detection_result = alignment_system.detect_circles_grid(
+            &self.test_image_left,
+            &self.test_image_right,
+            &self.rectify_maps_path,
+        );
+        let detection_time = start_time.elapsed();
+        
+        match detection_result {
+            Ok((corners_left, corners_right)) => {
+                println!("✅ 圆点检测成功!");
+                println!("   左眼检测到: {} 个圆点", corners_left.len());
+                println!("   右眼检测到: {} 个圆点", corners_right.len());
+                println!("   检测耗时: {:.1} ms", detection_time.as_millis());
+                
+                // 验证圆点数量
+                if corners_left.len() == 40 && corners_right.len() == 40 {
+                    println!("✓ 圆点数量正确 (期望40个)");
+                } else {
+                    println!("⚠️ 圆点数量异常 (期望40个, 实际左眼{}个, 右眼{}个)", 
+                            corners_left.len(), corners_right.len());
+                }
+                
+                // 打印部分圆点坐标用于验证
+                println!("📍 左眼前5个圆点坐标:");
+                for i in 0..std::cmp::min(5, corners_left.len()) {
+                    let point = corners_left.get(i)?;
+                    println!("   点{}: ({:.2}, {:.2})", i, point.x, point.y);
+                }
+                
+            }
+            Err(e) => {
+                println!("❌ 圆点检测失败: {}", e);
+                
+                // 尝试分析失败原因
+                println!("\n🔍 失败原因分析:");
+                
+                // 1. 检查SimpleBlobDetector参数
+                println!("1. 测试SimpleBlobDetector参数...");
+                let detector = alignment_system.create_optimized_blob_detector()?;
+                println!("   ✓ SimpleBlobDetector创建成功");
+                
+                // 2. 测试单独的图像检测
+                println!("2. 测试单独图像检测...");
+                self.test_individual_image_detection()?;
+                
+                return Err(format!("圆点检测失败: {}", e).into());
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 测试单独的图像检测
+    fn test_individual_image_detection(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let alignment_system = self.alignment_system.as_mut().unwrap();
+        
+        // 直接在原始图像上测试检测
+        let pattern_size = core::Size::new(4, 10);
+        let mut corners = core::Vector::<core::Point2f>::new();
+        let detector = alignment_system.create_optimized_blob_detector()?;
+        
+        println!("   测试左图原始检测...");
+        let found = alignment_system.detect_circles_full_image(
+            &self.test_image_left,
+            pattern_size,
+            &mut corners,
+            &detector,
+        )?;
+        
+        if found {
+            println!("   ✓ 左图原始检测成功: {} 个圆点", corners.len());
+        } else {
+            println!("   ❌ 左图原始检测失败");
+            
+            // 尝试保存带检测结果的图像
+            let mut debug_img = self.test_image_left.clone();
+            if debug_img.channels() == 1 {
+                imgproc::cvt_color(&self.test_image_left, &mut debug_img, imgproc::COLOR_GRAY2BGR, 0, AlgorithmHint::ALGO_HINT_DEFAULT)?;
+            }
+            
+            // 尝试使用不同的检测参数
+            self.try_different_detection_params(&self.test_image_left)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// 尝试不同的检测参数
+    fn try_different_detection_params(&self, image: &core::Mat) -> Result<(), Box<dyn std::error::Error>> {
+        println!("   🔧 尝试不同的SimpleBlobDetector参数...");
+        
+        // 参数组合1: 更宽松的参数
+        let mut params1 = opencv::features2d::SimpleBlobDetector_Params::default()?;
+        params1.min_threshold = 50.0;
+        params1.max_threshold = 220.0;
+        params1.threshold_step = 10.0;
+        params1.filter_by_area = true;
+        params1.min_area = 50.0;
+        params1.max_area = 10000.0;
+        params1.filter_by_circularity = false;
+        params1.filter_by_convexity = false;
+        params1.filter_by_inertia = false;
+        
+        let detector1 = opencv::features2d::SimpleBlobDetector::create(params1)?;
+        let mut corners1 = core::Vector::<core::Point2f>::new();
+        let found1 = opencv::calib3d::find_circles_grid(
+            image,
+            core::Size::new(4, 10),
+            &mut corners1,
+            opencv::calib3d::CALIB_CB_ASYMMETRIC_GRID,
+            Some(&detector1.into()),
+            opencv::calib3d::CirclesGridFinderParameters::default()?,
+        )?;
+        
+        println!("     参数组1 (宽松): {} - {} 个圆点", 
+                if found1 { "成功" } else { "失败" }, corners1.len());
+        
+        // 参数组合2: 更严格的参数
+        let mut params2 = opencv::features2d::SimpleBlobDetector_Params::default()?;
+        params2.min_threshold = 100.0;
+        params2.max_threshold = 200.0;
+        params2.threshold_step = 50.0;
+        params2.filter_by_area = true;
+        params2.min_area = 200.0;
+        params2.max_area = 5000.0;
+        params2.filter_by_circularity = true;
+        params2.min_circularity = 0.8;
+        params2.filter_by_convexity = false;
+        params2.filter_by_inertia = false;
+        
+        let detector2 = opencv::features2d::SimpleBlobDetector::create(params2)?;
+        let mut corners2 = core::Vector::<core::Point2f>::new();
+        let found2 = opencv::calib3d::find_circles_grid(
+            image,
+            core::Size::new(4, 10),
+            &mut corners2,
+            opencv::calib3d::CALIB_CB_ASYMMETRIC_GRID,
+            Some(&detector2.into()),
+            opencv::calib3d::CirclesGridFinderParameters::default()?,
+        )?;
+        
+        println!("     参数组2 (严格): {} - {} 个圆点", 
+                if found2 { "成功" } else { "失败" }, corners2.len());
+        
+        // 参数组合3: 默认参数
+        let params3 = opencv::features2d::SimpleBlobDetector_Params::default()?;
+        let detector3 = opencv::features2d::SimpleBlobDetector::create(params3)?;
+        let mut corners3 = core::Vector::<core::Point2f>::new();
+        let found3 = opencv::calib3d::find_circles_grid(
+            image,
+            core::Size::new(4, 10),
+            &mut corners3,
+            opencv::calib3d::CALIB_CB_ASYMMETRIC_GRID,
+            Some(&detector3.into()),
+            opencv::calib3d::CirclesGridFinderParameters::default()?,
+        )?;
+        
+        println!("     参数组3 (默认): {} - {} 个圆点", 
+                if found3 { "成功" } else { "失败" }, corners3.len());
+        
+        Ok(())
+    }
+    
+    /// 测试完整的合像检测流程
+    fn test_complete_alignment(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("\n🎯 测试3: 完整合像检测流程");
+        println!("{}", "-".repeat(40));
+        
+        let alignment_system = self.alignment_system.as_mut().unwrap();
+        
+        // 首先进行圆点检测
+        let detection_result = alignment_system.detect_circles_grid(
+            &self.test_image_left,
+            &self.test_image_right,
+            &self.rectify_maps_path,
+        );
+        
+        match detection_result {
+            Ok((corners_left, corners_right)) => {
+                println!("✓ 圆点检测成功，开始姿态和合像分析...");
+                
+                // 测试左眼姿态检测
+                let left_pose = alignment_system.check_left_eye_pose(&corners_left)?;
+                println!("📊 左眼姿态: roll={:.3}°, pitch={:.3}°, yaw={:.3}°, 通过={}", 
+                        left_pose.roll, left_pose.pitch, left_pose.yaw, left_pose.pass);
+                
+                // 测试右眼姿态检测
+                let right_pose = alignment_system.check_right_eye_pose(&corners_right)?;
+                println!("📊 右眼姿态: roll={:.3}°, pitch={:.3}°, yaw={:.3}°, 通过={}", 
+                        right_pose.roll, right_pose.pitch, right_pose.yaw, right_pose.pass);
+                
+                // 测试左眼居中检测
+                let centering = alignment_system.check_left_eye_centering(&corners_left, None)?;
+                println!("📊 左眼居中: 居中={}, 最大偏移={:.1}px, 容差={:.1}px", 
+                        centering.is_centered, centering.max_offset_distance, centering.tolerance_px);
+                
+                // 测试双眼合像检测
+                if left_pose.pass && right_pose.pass {
+                    let alignment = alignment_system.check_dual_eye_alignment(
+                        &corners_left, &corners_right, true
+                    )?;
+                    println!("📊 双眼合像: RMS={:.3}px, P95={:.3}px, Max={:.3}px, 通过={}", 
+                            alignment.rms, alignment.p95, alignment.max_err, alignment.pass);
+                } else {
+                    println!("⚠️ 姿态检测未通过，跳过合像分析");
+                }
+                
+                // 测试调整向量计算
+                let adjustment = alignment_system.calculate_adjustment_vectors(
+                    Some(&left_pose),
+                    Some(&centering),
+                    Some(&right_pose),
+                    None,
+                );
+                println!("📊 调整优先级: {:?}", adjustment.priority);
+                
+                println!("✅ 完整检测流程测试成功!");
+                
+            }
+            Err(e) => {
+                println!("❌ 完整流程测试失败: {}", e);
+                return Err(e);
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 保存调试图像
+    fn save_debug_images(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("\n💾 测试4: 保存调试图像");
+        println!("{}", "-".repeat(40));
+        
+        // 保存处理后的图像用于手动检查
+        imgcodecs::imwrite("debug_left_processed.png", &self.test_image_left, &core::Vector::<i32>::new())?;
+        imgcodecs::imwrite("debug_right_processed.png", &self.test_image_right, &core::Vector::<i32>::new())?;
+        
+        println!("✓ 调试图像已保存:");
+        println!("   - debug_left_original.png (左图原始)");
+        println!("   - debug_right_original.png (右图原始)");
+        println!("   - debug_left_processed.png (左图处理后)");
+        println!("   - debug_right_processed.png (右图处理后)");
+        
+        // 如果存在alignment_debug.png，也报告
+        if Path::new("alignment_debug.png").exists() {
+            println!("   - alignment_debug.png (合像分析结果)");
+        }
+        
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🚀 启动合像检测调试测试程序");
+    
+    let mut test = AlignmentDebugTest::new()?;
+    test.run_debug_tests()?;
+    
+    println!("\n🎉 调试测试程序完成");
+    println!("请检查生成的调试图像文件，分析圆点检测问题");
+    
+    Ok(())
+} 

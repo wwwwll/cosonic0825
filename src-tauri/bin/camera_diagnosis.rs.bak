@@ -1,0 +1,173 @@
+//! 相机诊断程序 - 检查图像尺寸和标定板检测
+//! 
+//! 用于诊断标定板检测失败的问题
+
+use merging_image_lib::camera_manager::SimpleCameraManager;
+use opencv::{core::Size, imgcodecs, imgproc, prelude::*};
+
+fn main() {
+    println!("🔍 相机诊断程序");
+    println!("================");
+    
+    // 1. 检查SimpleCameraManager
+    println!("\n📷 检查SimpleCameraManager...");
+    let mut camera_manager = match SimpleCameraManager::new() {
+        Ok(cm) => {
+            println!("✅ SimpleCameraManager初始化成功");
+            cm
+        },
+        Err(e) => {
+            println!("❌ SimpleCameraManager初始化失败: {}", e);
+            return;
+        }
+    };
+    
+    // 2. 启动相机并获取一帧
+    println!("\n📸 启动相机并获取测试帧...");
+    if let Err(e) = camera_manager.start() {
+        println!("❌ 启动相机失败: {}", e);
+        return;
+    }
+    
+    let (left_data, right_data) = match camera_manager.capture_and_process(false) {
+        Ok(data) => {
+            println!("✅ 获取图像数据成功");
+            println!("   左图数据大小: {} bytes", data.0.len());
+            println!("   右图数据大小: {} bytes", data.1.len());
+            data
+        },
+        Err(e) => {
+            println!("❌ 获取图像数据失败: {}", e);
+            let _ = camera_manager.stop();
+            return;
+        }
+    };
+    
+    // 3. 分析图像数据
+    println!("\n🔍 分析图像数据...");
+    analyze_image_data("左图", &left_data);
+    analyze_image_data("右图", &right_data);
+    
+    // 4. 尝试不同的图像尺寸转换
+    println!("\n🧪 尝试不同的图像尺寸转换...");
+    test_different_dimensions(&left_data);
+    
+    // 5. 停止相机
+    let _ = camera_manager.stop();
+    println!("\n✅ 诊断完成");
+}
+
+fn analyze_image_data(name: &str, data: &[u8]) {
+    println!("  📊 {}:", name);
+    println!("     数据长度: {} bytes", data.len());
+    
+    // 尝试推断可能的图像尺寸
+    let possible_sizes = vec![
+        (2448, 2048, "全分辨率"),
+        (1224, 1024, "1/2分辨率"),
+        (612, 512, "1/4分辨率"),
+        (2048, 2448, "旋转90度"),
+        (1920, 1080, "1080p"),
+        (1280, 720, "720p"),
+    ];
+    
+    println!("     可能的尺寸:");
+    for (w, h, desc) in possible_sizes {
+        let expected_size = w * h;
+        if expected_size == data.len() {
+            println!("       ✅ {}x{} ({}) - 匹配!", w, h, desc);
+        } else {
+            println!("       ❌ {}x{} ({}) - 期望{}, 实际{}", w, h, desc, expected_size, data.len());
+        }
+    }
+}
+
+fn test_different_dimensions(data: &[u8]) {
+    // 根据数据大小推断最可能的尺寸
+    let data_len = data.len();
+    
+    // 常见的相机分辨率
+    let test_dimensions = vec![
+        (2448i32, 2048i32),
+        (1224i32, 1024i32), 
+        (612i32, 512i32),
+        (2048i32, 2448i32),
+    ];
+    
+    for (width, height) in test_dimensions {
+        let expected_size = (width * height) as usize;
+        if expected_size == data_len {
+            println!("  🎯 测试尺寸 {}x{}", width, height);
+            
+            match raw_data_to_mat(data, width, height) {
+                Ok(mat) => {
+                    println!("    ✅ Mat创建成功: {}x{}", mat.cols(), mat.rows());
+                    
+                    // 保存测试图像
+                    let test_path = format!("test_image_{}x{}.png", width, height);
+                    if imgcodecs::imwrite(&test_path, &mat, &opencv::core::Vector::new()).is_ok() {
+                        println!("    ✅ 测试图像已保存: {}", test_path);
+                        
+                        // 尝试标定板检测
+                        test_calibration_detection(&mat, width, height);
+                    }
+                },
+                Err(e) => {
+                    println!("    ❌ Mat创建失败: {}", e);
+                }
+            }
+        }
+    }
+}
+
+fn raw_data_to_mat(image_data: &[u8], width: i32, height: i32) -> Result<opencv::core::Mat, String> {
+    use opencv::core::{Mat, CV_8UC1, Scalar};
+    
+    let expected_size = (width * height) as usize;
+    if image_data.len() != expected_size {
+        return Err(format!("数据大小不匹配: 期望 {} 字节，实际 {} 字节", 
+            expected_size, image_data.len()));
+    }
+    
+    let mut mat = Mat::new_rows_cols_with_default(height, width, CV_8UC1, Scalar::all(0.0))
+        .map_err(|e| format!("创建Mat失败: {}", e))?;
+    
+    unsafe {
+        let mat_data = mat.ptr_mut(0).map_err(|e| format!("获取Mat指针失败: {}", e))?;
+        std::ptr::copy_nonoverlapping(image_data.as_ptr(), mat_data, image_data.len());
+    }
+    
+    Ok(mat)
+}
+
+fn test_calibration_detection(mat: &opencv::core::Mat, width: i32, height: i32) {
+    use merging_image_lib::modules::calibration_circles::Calibrator;
+    
+    println!("    🔍 测试标定板检测...");
+    
+    let mut calibrator = match Calibrator::new(
+        Size::new(width, height),
+        15.0,    // circle_diameter
+        25.0,   // center_distance  
+        Size::new(10, 4), // pattern_size
+        2.0,    // error_threshold
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("    ❌ 创建标定器失败: {}", e);
+            return;
+        }
+    };
+    
+    let detected = calibrator.quick_detect_calibration_pattern(mat);
+    println!("    {} 标定板检测结果: {}", 
+        if detected { "✅" } else { "❌" }, detected);
+    
+    if !detected {
+        println!("    💡 建议检查:");
+        println!("       - 标定板是否在视野内");
+        println!("       - 光照是否充足");
+        println!("       - 图像是否清晰");
+        println!("       - 标定板规格是否为10x4 asymmetric circles");
+    }
+} 

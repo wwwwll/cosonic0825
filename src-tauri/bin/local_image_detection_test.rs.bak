@@ -1,0 +1,365 @@
+// local_image_detection_test.rs - 使用本地图像测试合像检测
+// 专门用于调试圆点检测问题，使用指定目录下的图像文件
+
+use std::time::Instant;
+use std::path::Path;
+use opencv::{core, imgcodecs, imgproc, prelude::*};
+use merging_image_lib::modules::alignment::AlignmentSystem;
+
+/// 本地图像检测测试器
+pub struct LocalImageDetectionTest {
+    alignment_system: Option<AlignmentSystem>,
+    test_images_dir: String,
+    rectify_maps_path: String,
+}
+
+impl LocalImageDetectionTest {
+    /// 创建测试器实例
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        println!("🔧 初始化本地图像检测测试器...");
+        
+        // 设置测试图像目录
+        let test_images_dir = r"C:\Users\Y000010\MVS\Data\test_0819\alignment_test".to_string();
+        
+        // 确定项目路径
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path.parent().unwrap();
+        let src_tauri_dir = exe_dir.parent().unwrap().parent().unwrap();
+        
+        println!("📍 项目根目录: {:?}", src_tauri_dir);
+        println!("📁 测试图像目录: {}", test_images_dir);
+        
+        // 构造参数文件路径
+        let rectify_maps = src_tauri_dir.join("yaml_last_param_file/rectify_maps.yaml");
+        
+        // 验证重映射文件存在
+        if !rectify_maps.exists() {
+            return Err(format!("重映射文件不存在: {:?}", rectify_maps).into());
+        }
+        
+        Ok(Self {
+            alignment_system: None,
+            test_images_dir,
+            rectify_maps_path: rectify_maps.to_string_lossy().to_string(),
+        })
+    }
+    
+    /// 初始化合像检测系统
+    fn init_alignment_system(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.alignment_system.is_some() {
+            return Ok(());
+        }
+        
+        println!("🚀 初始化合像检测系统...");
+        
+        let exe_path = std::env::current_exe()?;
+        let exe_dir = exe_path.parent().unwrap();
+        let src_tauri_dir = exe_dir.parent().unwrap().parent().unwrap();
+        
+        // 使用yaml_last_param_file目录下的参数文件
+        let left_cam_params = src_tauri_dir.join("yaml_last_param_file/left_camera_params.yaml");
+        let right_cam_params = src_tauri_dir.join("yaml_last_param_file/right_camera_params.yaml");
+        let stereo_params = src_tauri_dir.join("yaml_last_param_file/stereo_params.yaml");
+        let rectify_params = src_tauri_dir.join("yaml_last_param_file/rectify_params.yaml");
+        
+        // 检查标定文件是否存在
+        let required_files = [
+            ("左相机参数", &left_cam_params),
+            ("右相机参数", &right_cam_params),
+            ("双目参数", &stereo_params),
+            ("校正参数", &rectify_params),
+        ];
+        
+        for (name, path) in &required_files {
+            if !path.exists() {
+                return Err(format!("{}文件不存在: {:?}", name, path).into());
+            }
+            println!("   ✓ {}: {:?}", name, path);
+        }
+        
+        let image_size = core::Size::new(2448, 2048);
+        
+        // 使用预加载版本创建系统
+        let alignment_system = AlignmentSystem::new_with_preload(
+            image_size,
+            left_cam_params.to_str().unwrap(),
+            right_cam_params.to_str().unwrap(),
+            stereo_params.to_str().unwrap(),
+            rectify_params.to_str().unwrap(),
+            &self.rectify_maps_path,
+        )?;
+        
+        self.alignment_system = Some(alignment_system);
+        println!("✓ 合像检测系统初始化完成");
+        
+        Ok(())
+    }
+    
+    /// 运行本地图像检测测试
+    pub fn run_tests(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("\n🚀 开始本地图像检测测试");
+        println!("{}", "=".repeat(60));
+        
+        // 初始化系统
+        self.init_alignment_system()?;
+        
+        // 测试多个图像文件
+        for i in 1..=15 {
+            let filename = format!("calib_left_{:02}.png", i);
+            let filepath = format!("{}\\{}", self.test_images_dir, filename);
+            
+            println!("\n📷 测试图像 {}/{}: {}", i, 15, filename);
+            println!("{}", "-".repeat(40));
+            
+            if !Path::new(&filepath).exists() {
+                println!("⚠️ 文件不存在，跳过: {}", filepath);
+                continue;
+            }
+            
+            // 加载图像
+            let image = imgcodecs::imread(&filepath, imgcodecs::IMREAD_GRAYSCALE)?;
+            if image.empty() {
+                println!("❌ 无法加载图像: {}", filepath);
+                continue;
+            }
+            
+            println!("✓ 图像加载成功: {}×{}", image.cols(), image.rows());
+            
+            // 测试圆点检测
+            self.test_single_image(&image, &filename, i)?;
+        }
+        
+        println!("\n🎉 本地图像检测测试完成");
+        Ok(())
+    }
+    
+    /// 测试单张图像
+    fn test_single_image(&mut self, image: &core::Mat, filename: &str, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let alignment_system = self.alignment_system.as_mut().unwrap();
+        
+        // 创建优化的SimpleBlobDetector
+        let detector = alignment_system.create_optimized_blob_detector()?;
+        
+        // 准备检测参数
+        let pattern_size = core::Size::new(4, 10);  // 10×4 asymmetric circles grid
+        let mut corners = core::Vector::<core::Point2f>::new();
+        
+        println!("🔍 执行圆点检测...");
+        let start_time = Instant::now();
+        
+        // 执行检测
+        let found = alignment_system.detect_circles_full_image(
+            image,
+            pattern_size,
+            &mut corners,
+            &detector,
+        )?;
+        
+        let detection_time = start_time.elapsed();
+        println!("⏱️ 检测耗时: {:.1} ms", detection_time.as_millis());
+        
+        if found {
+            println!("✅ 检测成功! 找到 {} 个圆点", corners.len());
+            
+            // 生成调试图像
+            //self.save_debug_image(image, &corners, filename, index, true)?;
+            
+            // 分析圆点分布
+            self.analyze_corners(&corners)?;
+        } else {
+            println!("❌ 检测失败!");
+            
+            // 保存失败的调试图像
+            //self.save_debug_image(image, &corners, filename, index, false)?;
+            
+            // 尝试分析失败原因
+            self.analyze_failure_reason(image)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// 保存调试图像
+    fn save_debug_image(
+        &self,
+        image: &core::Mat,
+        corners: &core::Vector<core::Point2f>,
+        filename: &str,
+        index: usize,
+        success: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // 转换为彩色图像以便绘制
+        let mut debug_image = core::Mat::default();
+        if image.channels() == 1 {
+            imgproc::cvt_color(
+                image,
+                &mut debug_image,
+                imgproc::COLOR_GRAY2BGR,
+                0,
+                core::AlgorithmHint::ALGO_HINT_DEFAULT
+            )?;
+        } else {
+            debug_image = image.clone();
+        }
+        
+        // 如果检测成功，绘制圆点
+        if success && corners.len() > 0 {
+            for (i, point) in corners.iter().enumerate() {
+                // 绘制圆点（红色）
+                imgproc::circle(
+                    &mut debug_image,
+                    core::Point::new(point.x as i32, point.y as i32),
+                    5,
+                    core::Scalar::new(0.0, 0.0, 255.0, 0.0),
+                    2,
+                    imgproc::LINE_8,
+                    0,
+                )?;
+                
+                // 添加序号（绿色）
+                let text = format!("{}", i);
+                imgproc::put_text(
+                    &mut debug_image,
+                    &text,
+                    core::Point::new(point.x as i32 + 10, point.y as i32 - 10),
+                    imgproc::FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    core::Scalar::new(0.0, 255.0, 0.0, 0.0),
+                    1,
+                    imgproc::LINE_8,
+                    false,
+                )?;
+            }
+        }
+        
+        // 添加状态文字
+        let status_text = if success {
+            format!("SUCCESS: {} points", corners.len())
+        } else {
+            "FAILED: No points detected".to_string()
+        };
+        
+        imgproc::put_text(
+            &mut debug_image,
+            &status_text,
+            core::Point::new(20, 40),
+            imgproc::FONT_HERSHEY_SIMPLEX,
+            1.0,
+            if success {
+                core::Scalar::new(0.0, 255.0, 0.0, 0.0)  // 绿色
+            } else {
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0)  // 红色
+            },
+            2,
+            imgproc::LINE_8,
+            false,
+        )?;
+        
+        // 保存调试图像
+        let debug_filename = format!("debug_{:02}_{}_{}.png", 
+                                    index,
+                                    if success { "SUCCESS" } else { "FAILED" },
+                                    filename);
+        imgcodecs::imwrite(&debug_filename, &debug_image, &core::Vector::<i32>::new())?;
+        println!("💾 已保存调试图像: {}", debug_filename);
+        
+        Ok(())
+    }
+    
+    /// 分析圆点分布
+    fn analyze_corners(&self, corners: &core::Vector<core::Point2f>) -> Result<(), Box<dyn std::error::Error>> {
+        if corners.len() == 0 {
+            return Ok(());
+        }
+        
+        println!("\n📊 圆点分布分析:");
+        
+        // 计算边界
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_y = f32::MAX;
+        let mut max_y = f32::MIN;
+        
+        for i in 0..corners.len() {
+            let point = corners.get(i)?;
+            min_x = min_x.min(point.x);
+            max_x = max_x.max(point.x);
+            min_y = min_y.min(point.y);
+            max_y = max_y.max(point.y);
+        }
+        
+        println!("   X范围: [{:.0}, {:.0}] (宽度: {:.0})", min_x, max_x, max_x - min_x);
+        println!("   Y范围: [{:.0}, {:.0}] (高度: {:.0})", min_y, max_y, max_y - min_y);
+        
+        // 输出前几个点的坐标
+        println!("   前5个点坐标:");
+        for i in 0..std::cmp::min(5, corners.len()) {
+            let point = corners.get(i)?;
+            println!("     点{}: ({:.0}, {:.0})", i, point.x, point.y);
+        }
+        
+        // 检查第0点和第4点的关系（用于判断列顺序）
+        if corners.len() >= 5 {
+            let p0 = corners.get(0)?;
+            let p4 = corners.get(4)?;
+            println!("   列顺序检查: 点0.x={:.0}, 点4.x={:.0}", p0.x, p4.x);
+            if p0.x < p4.x {
+                println!("   ⚠️ 可能需要重新排序（点0应该在点4右边）");
+            } else {
+                println!("   ✓ 列顺序正确");
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 分析检测失败原因
+    fn analyze_failure_reason(&self, image: &core::Mat) -> Result<(), Box<dyn std::error::Error>> {
+        println!("\n🔍 失败原因分析:");
+        
+        // 分析图像统计信息
+        let mut mean = core::Scalar::default();
+        let mut std_dev = core::Scalar::default();
+        core::mean_std_dev(image, &mut mean, &mut std_dev, &core::no_array())?;
+        
+        println!("   图像平均值: {:.2}", mean[0]);
+        println!("   图像标准差: {:.2}", std_dev[0]);
+        
+        if std_dev[0] < 20.0 {
+            println!("   ⚠️ 图像对比度过低（标准差 < 20）");
+        }
+        
+        if mean[0] < 50.0 {
+            println!("   ⚠️ 图像过暗（平均值 < 50）");
+        } else if mean[0] > 200.0 {
+            println!("   ⚠️ 图像过亮（平均值 > 200）");
+        }
+        
+        // 检查图像尺寸
+        if image.cols() != 2448 || image.rows() != 2048 {
+            println!("   ⚠️ 图像尺寸不标准: {}×{} (期望: 2448×2048)", 
+                    image.cols(), image.rows());
+        }
+        
+        println!("\n   建议:");
+        println!("   1. 检查标定板是否完整在画面中");
+        println!("   2. 确保图像对焦清晰");
+        println!("   3. 调整光照条件，避免过暗或过亮");
+        println!("   4. 确保是10×4的asymmetric circles grid");
+        
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🚀 启动本地图像检测测试程序");
+    println!("测试目录: C:\\Users\\Y000010\\MVS\\Data\\test_0819\\alignment_test");
+    
+    let mut test = LocalImageDetectionTest::new()?;
+    test.run_tests()?;
+    
+    println!("\n🎉 测试程序完成");
+    println!("请检查生成的debug_*.png文件，分析检测结果");
+    
+    Ok(())
+} 

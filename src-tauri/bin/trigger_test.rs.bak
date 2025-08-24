@@ -1,0 +1,151 @@
+/**
+ * @file trigger_test.rs
+ * @brief 触发模式控制单元测试
+ * 
+ * 测试内容：
+ * 1. 软触发模式设置
+ * 2. 10fps同步采集测试
+ * 3. 超时处理验证
+ * 
+ * cargo build --bin trigger_test
+ * cargo run --bin trigger_test
+ */
+
+use std::time::{Duration, Instant};
+use std::thread;
+use merging_image_lib::camera_ffi::{CameraHandle, TriggerMode};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🚀 触发模式控制单元测试开始");
+    println!("===============================");
+
+    // 1. 初始化相机
+    println!("📷 初始化相机...");
+    let camera_handle = match CameraHandle::camera_init_ffi() {
+        Ok(handle) => {
+            println!("✅ 相机初始化成功");
+            handle
+        }
+        Err(code) => {
+            println!("❌ 相机初始化失败，错误码: 0x{:x}", code);
+            return Err(format!("相机初始化失败: 0x{:x}", code).into());
+        }
+    };
+
+    // 2. 设置软触发模式
+    println!("\n🎯 设置软触发模式...");
+    match camera_handle.camera_set_trigger_mode_ffi(TriggerMode::Software) {
+        Ok(_) => println!("✅ 软触发模式设置成功"),
+        Err(code) => {
+            println!("❌ 软触发模式设置失败，错误码: 0x{:x}", code);
+            return Err(format!("软触发模式设置失败: 0x{:x}", code).into());
+        }
+    }
+
+    // 3. 准备缓冲区
+    let frame_buf_size = CameraHandle::camera_get_frame_buf_size_ffi()
+        .map_err(|e| format!("获取帧缓冲区大小失败: 0x{:x}", e))?;
+    println!("📦 帧缓冲区大小: {} bytes", frame_buf_size);
+
+    let mut left_buffer = vec![0u8; frame_buf_size];
+    let mut right_buffer = vec![0u8; frame_buf_size];
+    
+    let mut out_bufs = [
+        left_buffer.as_mut_ptr(),
+        right_buffer.as_mut_ptr(),
+    ];
+    let mut out_sizes = [0u32; 2];
+
+    // 4. 10fps同步采集测试
+    println!("\n⏱️  开始10fps同步采集测试 (持续10秒)...");
+    let test_duration = Duration::from_secs(10);
+    let frame_interval = Duration::from_millis(100); // 10fps = 100ms间隔
+    let start_time = Instant::now();
+    
+    let mut frame_count = 0;
+    let mut success_count = 0;
+    let mut timeout_count = 0;
+    let mut error_count = 0;
+
+    while start_time.elapsed() < test_duration {
+        let frame_start = Instant::now();
+        
+        // 执行软触发
+        match camera_handle.camera_software_trigger_ffi(&mut out_bufs, &mut out_sizes) {
+            Ok(_) => {
+                success_count += 1;
+                let capture_time = frame_start.elapsed();
+                println!("📸 帧 #{}: 左相机={}字节, 右相机={}字节, 耗时={:.2}ms", 
+                    frame_count + 1, out_sizes[0], out_sizes[1], 
+                    capture_time.as_secs_f32() * 1000.0);
+                
+                // 检查超时要求 (≤ 50ms)
+                if capture_time > Duration::from_millis(50) {
+                    println!("⚠️  警告：抓帧耗时超过50ms: {:.2}ms", capture_time.as_secs_f32() * 1000.0);
+                }
+            }
+            Err(code) => {
+                if code == -1001 { // ERR_SOFT_TRIGGER_TIMEOUT
+                    timeout_count += 1;
+                    println!("⏰ 帧 #{}: 软触发超时", frame_count + 1);
+                } else {
+                    error_count += 1;
+                    println!("❌ 帧 #{}: 软触发错误，错误码: 0x{:x}", frame_count + 1, code);
+                }
+            }
+        }
+        
+        frame_count += 1;
+        
+        // 控制10fps帧率：等待到下一个100ms间隔
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_interval {
+            thread::sleep(frame_interval - elapsed);
+        }
+    }
+
+    // 5. 测试结果统计
+    println!("\n📊 测试结果统计");
+    println!("===============================");
+    println!("总帧数: {}", frame_count);
+    println!("成功帧数: {} ({:.1}%)", success_count, (success_count as f32 / frame_count as f32) * 100.0);
+    println!("超时帧数: {} ({:.1}%)", timeout_count, (timeout_count as f32 / frame_count as f32) * 100.0);
+    println!("错误帧数: {} ({:.1}%)", error_count, (error_count as f32 / frame_count as f32) * 100.0);
+    
+    let actual_fps = success_count as f32 / test_duration.as_secs_f32();
+    println!("实际帧率: {:.2} fps", actual_fps);
+    
+    // 6. 验收标准检查
+    println!("\n✅ 验收标准检查");
+    println!("===============================");
+    
+    let success_rate = (success_count as f32 / frame_count as f32) * 100.0;
+    let fps_error = (actual_fps - 10.0).abs();
+    
+    println!("成功率要求: ≥90% | 实际: {:.1}% | {}", 
+        success_rate, if success_rate >= 90.0 { "✅ 通过" } else { "❌ 失败" });
+    
+    println!("帧率精度要求: 10±1fps | 实际: {:.2}fps | {}", 
+        actual_fps, if fps_error <= 1.0 { "✅ 通过" } else { "❌ 失败" });
+    
+    println!("超时要求: ≤50ms | {}", 
+        if timeout_count == 0 { "✅ 通过" } else { "⚠️  有超时发生" });
+
+    // 7. 清理资源
+    println!("\n🧹 清理资源...");
+    match camera_handle.camera_release_ffi() {
+        Ok(_) => println!("✅ 相机资源释放成功"),
+        Err(code) => println!("⚠️  相机资源释放警告: 0x{:x}", code),
+    }
+
+    println!("\n🎉 触发模式控制单元测试完成！");
+    
+    // 判断整体测试结果
+    if success_rate >= 90.0 && fps_error <= 1.0 {
+        println!("🟢 测试结果: 通过");
+        Ok(())
+    } else {
+        println!("🔴 测试结果: 失败");
+        Err("测试未通过验收标准".into())
+    }
+} 

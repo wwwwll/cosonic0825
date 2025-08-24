@@ -1,0 +1,2306 @@
+// connected_components_circle_detection_test.rs - 连通域圆点检测测试
+// 替换SimpleBlobDetector，使用连通域+面积过滤实现更快速、精确的圆点检测
+
+use std::path::Path;
+use std::time::Instant;
+use opencv::{core, imgcodecs, imgproc, prelude::*};
+
+/// 🎨 V3: 圆心细化来源标记（用于debug可视化）
+#[derive(Copy, Clone)]
+enum RefineTag { 
+    Hi,       // 高置信（DT-only）
+    Lo,       // 低置信（径向采样+轻量圆拟合）
+    Fallback  // 回退到原坐标
+}
+
+/// 🚀 V3: 预计算掩膜（一次生成，多次复用）
+struct PrecomputedMasks {
+    inner_mask_u8: core::Mat,
+    ring_mask_u8: core::Mat,
+    center_template: core::Mat, // 中心小圆模板用于DT峰值搜索
+}
+
+impl PrecomputedMasks {
+    fn new(roi_side: i32, rin: f32, rout: f32) -> Result<Self, opencv::Error> {
+        let mut inner = core::Mat::zeros(roi_side, roi_side, core::CV_8U)?.to_mat()?;
+        let mut ring = inner.try_clone()?;
+        let c = core::Point::new(roi_side / 2, roi_side / 2);
+        
+        // 内盘掩膜
+        imgproc::circle(&mut inner, c, rin as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        
+        // 环域掩膜
+        imgproc::circle(&mut ring, c, rout as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        imgproc::circle(&mut ring, c, (rin * 1.3) as i32, core::Scalar::all(0.0), -1, imgproc::LINE_8, 0)?;
+        
+        // 中心小圆模板（用于DT峰值搜索）
+        let mut center = core::Mat::zeros(roi_side, roi_side, core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut center, c, (0.8 * rin) as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        
+        Ok(Self {
+            inner_mask_u8: inner,
+            ring_mask_u8: ring,
+            center_template: center,
+        })
+    }
+    
+    fn center_mask(&self, out: &mut core::Mat) -> Result<(), opencv::Error> {
+        *out = self.center_template.try_clone()?;
+        Ok(())
+    }
+}
+
+/// 🚀 V3: 极坐标采样表（预计算角度）
+struct PolarTable {
+    n: usize,
+    cos: Vec<f32>,
+    sin: Vec<f32>,
+}
+
+impl PolarTable {
+    fn new(n_dirs: usize) -> Self {
+        let mut cos = Vec::with_capacity(n_dirs);
+        let mut sin = Vec::with_capacity(n_dirs);
+        
+        for k in 0..n_dirs {
+            let theta = (k as f32) * 2.0 * std::f32::consts::PI / (n_dirs as f32);
+            cos.push(theta.cos());
+            sin.push(theta.sin());
+        }
+        
+        Self { n: n_dirs, cos, sin }
+    }
+}
+
+/// 🚀 V3.2: 预计算结构（复用掩膜与核）
+pub struct Precomputed {
+    // 复用的掩膜与核
+    pub mask_edgeband: core::Mat,   // r0±Δ
+    pub mask_outer: core::Mat,      // 噪声外环
+    pub kernel3: core::Mat,         // 3×3形态学核
+    pub polar: PolarTable,          // 低置信分支用
+    pub roi_side: i32,
+    pub r0: f32,
+    pub band_halfw: i32,
+    pub outer_w: i32,
+}
+
+impl Precomputed {
+    pub fn new(d_nom: f32) -> Result<Self, opencv::Error> {
+        let roi_side = ((1.6 * d_nom) as i32).clamp(96, 160);
+        let r0 = 0.5 * d_nom;
+        let band_halfw = 4;
+        let outer_w = 6;
+
+        // —— 生成固定ROI尺寸的两张环形掩膜（中心在ROI中心）——
+        let mut edgeband = core::Mat::zeros(roi_side, roi_side, core::CV_8U)?.to_mat()?;
+        let mut outer = core::Mat::zeros(roi_side, roi_side, core::CV_8U)?.to_mat()?;
+        let c = core::Point::new(roi_side / 2, roi_side / 2);
+
+        // edge band: r0±Δ
+        imgproc::circle(&mut edgeband, c, (r0 + band_halfw as f32) as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        imgproc::circle(&mut edgeband, c, (r0 - band_halfw as f32) as i32, core::Scalar::all(0.0), -1, imgproc::LINE_8, 0)?;
+
+        // outer noise ring: (r0+6) ~ (r0+6+outer_w)
+        imgproc::circle(&mut outer, c, (r0 + 6.0 + outer_w as f32) as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        imgproc::circle(&mut outer, c, (r0 + 6.0) as i32, core::Scalar::all(0.0), -1, imgproc::LINE_8, 0)?;
+
+        let kernel3 = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(3, 3), core::Point::new(-1, -1))?;
+        
+        Ok(Self {
+            mask_edgeband: edgeband,
+            mask_outer: outer,
+            kernel3,
+            polar: PolarTable::new(48),
+            roi_side,
+            r0,
+            band_halfw,
+            outer_w,
+        })
+    }
+}
+
+/// 连通域圆点检测器
+pub struct ConnectedComponentsDetector {
+    // 阈值参数
+    triangle_threshold: f64,
+    high_threshold: f64,
+    low_threshold: f64,
+    
+    // 面积过滤参数
+    min_area: f64,
+    max_area: f64,
+    
+    // 图像信息
+    image_size: core::Size,
+    expected_diameter_range: (f32, f32), // (67, 90)
+    
+    // 是否已初始化Triangle阈值
+    triangle_initialized: bool,
+    
+    // 🆕 新增优化参数
+    connectivity: i32,           // 连通性：4连通
+    roi_split_threshold: f64,    // ROI分裂阈值 (1.6 * max_expected_area)
+    aspect_ratio_min: f64,       // 长宽比最小值 0.6
+    aspect_ratio_max: f64,       // 长宽比最大值 1.7
+    fill_ratio_min: f64,         // 填充比最小值 0.45
+    fill_ratio_max: f64,         // 填充比最大值 0.95
+    
+    // 🎨 V3: Debug可视化相关字段
+    last_refine_tags: Option<Vec<RefineTag>>,
+    last_original_centers: Option<core::Vector<core::Point2f>>,
+}
+
+impl ConnectedComponentsDetector {
+    /// 创建检测器实例
+    pub fn new() -> Self {
+        // 计算期望面积范围
+        let min_expected_area = std::f64::consts::PI * (67.0_f64 / 2.0).powi(2); // ≈ 3525
+        let max_expected_area = std::f64::consts::PI * (90.0_f64 / 2.0).powi(2); // ≈ 6362
+        
+        Self {
+            triangle_threshold: 0.0,
+            high_threshold: 0.0,
+            low_threshold: 0.0,
+            // 🔧 第一轮宽松面积窗口 [1600, 14000]
+            min_area: 1600.0,
+            max_area: 14000.0,
+            image_size: core::Size::new(2448, 2048),
+            expected_diameter_range: (67.0, 90.0),
+            triangle_initialized: false,
+            // 🆕 新增优化参数
+            connectivity: 4,                                    // 4连通减少黏连
+            roi_split_threshold: 1.6 * max_expected_area,      // ≈ 10179
+            aspect_ratio_min: 0.6,                             // 长宽比范围
+            aspect_ratio_max: 1.7,
+            fill_ratio_min: 0.45,                              // 填充比范围 (圆≈π/4≈0.785)
+            fill_ratio_max: 0.95,
+            
+            // 🎨 V3: Debug可视化字段初始化
+            last_refine_tags: None,
+            last_original_centers: None,
+        }
+    }
+    
+    /// 初始化Triangle阈值 (仅在首次调用时执行)
+    fn initialize_triangle_threshold(&mut self, image: &core::Mat) -> Result<(), opencv::Error> {
+        if self.triangle_initialized {
+            return Ok(());
+        }
+        
+        println!("🔧 初始化Triangle阈值...");
+        let mut temp = core::Mat::default();
+        
+        // 使用Triangle算法计算初始阈值
+        self.triangle_threshold = imgproc::threshold(
+            image, 
+            &mut temp, 
+            0.0, 
+            255.0, 
+            imgproc::THRESH_BINARY | imgproc::THRESH_TRIANGLE
+        )?;
+        
+        // 🔧 计算高低阈值 - 高阈值更高，低阈值差距更大
+        self.high_threshold = self.triangle_threshold + 25.0;  // 收紧亮核
+        self.low_threshold = (self.high_threshold - 60.0).max(10.0);  // 更大差距
+        
+        println!("   Triangle阈值: {:.1}", self.triangle_threshold);
+        println!("   高阈值: {:.1}", self.high_threshold);
+        println!("   低阈值: {:.1}", self.low_threshold);
+        
+        self.triangle_initialized = true;
+        Ok(())
+    }
+    
+    /// 连通域圆点检测主函数
+    pub fn detect_circles(&mut self, image: &core::Mat) -> Result<core::Vector<core::Point2f>, opencv::Error> {
+        let detection_start = Instant::now();
+        
+        // 初始化阈值 (仅首次)
+        self.initialize_triangle_threshold(image)?;
+        
+        // 主路径：高阈值检测
+        let mut centers = self.detect_with_threshold(image, self.high_threshold)?;
+        println!("🔍 高阈值检测到 {} 个圆点", centers.len());
+        
+        // 兜底路径：如果检测数量不足，使用低阈值补充
+        if centers.len() < 40 {
+            println!("⚠️ 检测数量不足，启用低阈值兜底检测...");
+            let low_centers = self.detect_with_threshold(image, self.low_threshold)?;
+            println!("🔍 低阈值检测到 {} 个圆点", low_centers.len());
+            
+            // 合并去重 (简单距离去重)
+            centers = self.merge_and_deduplicate(centers, low_centers)?;
+            println!("🔗 合并去重后: {} 个圆点", centers.len());
+        }
+        
+        // 🆕 V3: 边界约束自适应圆心细化 (解决向阵列中心偏移问题，可回滚到背景平坦化版本)
+        let (refine_tags, original_centers) = if centers.len() == 40 {
+            println!("🔧 启动边界约束自适应圆心细化...");
+            let refine_start = Instant::now();
+            let original_centers = centers.clone(); // 🎨 保存原始坐标
+            let (refined_centers, tags) = self.refine_centers_adaptive_v3(image, centers)?;
+            centers = refined_centers;
+            let refine_time = refine_start.elapsed();
+            println!("   ✅ 边界约束细化完成，耗时: {:.1} ms", refine_time.as_millis());
+            (Some(tags), Some(original_centers))
+        } else {
+            (None, None)
+        };
+        
+        // 🎨 V3: 存储细化信息供debug使用
+        self.last_refine_tags = refine_tags;
+        self.last_original_centers = original_centers;
+        
+        let detection_time = detection_start.elapsed();
+        println!("⏱️  连通域检测总耗时: {:.1} ms", detection_time.as_millis());
+        
+        Ok(centers)
+    }
+    
+    /// 使用指定阈值进行连通域检测 - 新增背景平坦化预处理
+    fn detect_with_threshold(&self, image: &core::Mat, threshold: f64) -> Result<core::Vector<core::Point2f>, opencv::Error> {
+        println!("   🔍 阈值检测: {:.1}", threshold);
+        
+        // 🆕 背景平坦化预处理 (极轻量，<2ms)
+        let d_nom = (self.expected_diameter_range.0 + self.expected_diameter_range.1) / 2.0; // ≈ 78.5
+        let sigma = d_nom * 0.8; // ≈ 62.8
+        
+        // 高斯模糊提取背景 - 使用blur简化实现
+        let mut bg = core::Mat::default();
+        let kernel_size = ((sigma * 3.0) as i32 * 2 + 1).max(3); // 3σ规则
+        let ksize = core::Size::new(kernel_size, kernel_size);
+        imgproc::blur(image, &mut bg, ksize, core::Point::new(-1, -1), core::BORDER_DEFAULT)?;
+        
+        // 减去背景得到平坦化图像
+        let mut flat = core::Mat::default();
+        core::subtract(image, &bg, &mut flat, &core::Mat::default(), -1)?;
+        
+        // 快速限幅防止过曝区泛滥
+        let mut flat_truncated = core::Mat::default();
+        imgproc::threshold(&flat, &mut flat_truncated, 255.0, 255.0, imgproc::THRESH_TRUNC)?;
+        let flat = flat_truncated; // 重新绑定
+        
+        println!("     🔧 背景平坦化完成 (sigma={:.1})", sigma);
+        
+        // 二值化
+        let mut binary = core::Mat::default();
+        imgproc::threshold(&flat, &mut binary, threshold, 255.0, imgproc::THRESH_BINARY)?;
+        
+        // 连通域分析
+        let mut labels = core::Mat::default();
+        let mut stats = core::Mat::default();
+        let mut centroids = core::Mat::default();
+        
+        let num_labels = imgproc::connected_components_with_stats(
+            &binary, 
+            &mut labels, 
+            &mut stats, 
+            &mut centroids, 
+            self.connectivity, // 🔧 4连通减少黏连
+            core::CV_32S
+        )?;
+        
+        // 🔍 计数1: 连通域总数（阈值后，过滤前）
+        let total_components = num_labels - 1; // 减去背景
+        println!("   📊 [计数1] 连通域总数: {} (阈值后，过滤前)", total_components);
+        
+        // 🔍 收集所有连通域面积用于统计
+        let mut all_areas = Vec::new();
+        for i in 1..num_labels {
+            let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            all_areas.push(area as f64);
+        }
+        all_areas.sort_by(|a, b| b.partial_cmp(a).unwrap()); // 降序排列
+        
+        // 🔍 打印最大5个连通域的面积
+        println!("   📊 最大5个连通域面积: {:?}", 
+                &all_areas[..std::cmp::min(5, all_areas.len())]);
+        
+        // 面积过滤和形状筛选
+        let mut centers = core::Vector::<core::Point2f>::new();
+        let mut area_filtered_count = 0;
+        let mut shape_filtered_count = 0;
+        let mut roi_split_candidates = Vec::new();
+        
+        for i in 1..num_labels { // 跳过背景(标签0)
+            let area = *stats.at_2d::<i32>(i, imgproc::CC_STAT_AREA)?;
+            let width = *stats.at_2d::<i32>(i, imgproc::CC_STAT_WIDTH)?;
+            let height = *stats.at_2d::<i32>(i, imgproc::CC_STAT_HEIGHT)?;
+            
+            // 🔧 第一轮：宽松面积过滤
+            if area as f64 >= self.min_area && area as f64 <= self.max_area {
+                area_filtered_count += 1;
+                
+                // 🔧 形状筛选：长宽比和填充比
+                let aspect_ratio = width as f64 / height as f64;
+                let fill_ratio = area as f64 / (width as f64 * height as f64);
+                
+                let shape_ok = aspect_ratio >= self.aspect_ratio_min && 
+                              aspect_ratio <= self.aspect_ratio_max &&
+                              fill_ratio >= self.fill_ratio_min && 
+                              fill_ratio <= self.fill_ratio_max;
+                
+                if shape_ok {
+                    shape_filtered_count += 1;
+                    let cx = *centroids.at_2d::<f64>(i, 0)? as f32;
+                    let cy = *centroids.at_2d::<f64>(i, 1)? as f32;
+                    centers.push(core::Point2f::new(cx, cy));
+                } else {
+                    println!("   ⚠️ 形状筛选丢弃: 面积={}, 长宽比={:.2}, 填充比={:.2}", 
+                            area, aspect_ratio, fill_ratio);
+                }
+            } else if area as f64 > self.roi_split_threshold {
+                // 🔧 ROI分裂候选：面积过大的连通域
+                roi_split_candidates.push((i, area));
+            }
+        }
+        
+        println!("   📊 形状筛选: {} → {} 个", area_filtered_count, shape_filtered_count);
+        if !roi_split_candidates.is_empty() {
+            println!("   📊 ROI分裂候选: {} 个大连通域 (面积 > {:.0})", 
+                    roi_split_candidates.len(), self.roi_split_threshold);
+            
+            // 🔧 ROI分裂处理：距离变换 + 局部极大值
+            let split_centers = self.process_roi_split_candidates(
+                image, &binary, &labels, &stats, &roi_split_candidates
+            )?;
+            
+            if !split_centers.is_empty() {
+                println!("   🎯 ROI分裂成功: 从 {} 个大连通域中提取 {} 个圆心", 
+                        roi_split_candidates.len(), split_centers.len());
+                
+                // 将分裂得到的圆心添加到结果中
+                for center in split_centers {
+                    centers.push(center);
+                }
+            }
+        }
+        
+        // 🔍 计数2: 面积过滤后的个数
+        println!("   📊 [计数2] 面积过滤后: {} 个 ({:.0}-{:.0} px²)", 
+                area_filtered_count, self.min_area, self.max_area);
+        
+        // 🔍 计数3: 形状筛选后的最终个数
+        println!("   📊 [计数3] 形状筛选后: {} 个圆点", centers.len());
+        
+        // 🔍 问题诊断分析
+        if total_components >= 35 && area_filtered_count < 20 {
+            println!("   ⚠️ 诊断: 连通域足够但面积过滤大幅下降 → 亮区黏连 + 暗区过小");
+            if !roi_split_candidates.is_empty() {
+                println!("   💡 建议: 启用ROI分裂处理 {} 个大连通域", roi_split_candidates.len());
+            } else {
+                println!("   💡 建议: 降低阈值或调整面积窗口");
+            }
+        } else if total_components < 30 {
+            println!("   ⚠️ 诊断: 连通域总数偏少 → 阈值偏高导致暗点没出连通域");
+            println!("   💡 建议: 降低阈值 ({:.1} → {:.1}) 或使用局部Otsu兜底", 
+                    threshold, threshold * 0.8);
+        } else if area_filtered_count >= 30 && shape_filtered_count < 25 {
+            println!("   ⚠️ 诊断: 面积过滤正常但形状筛选丢弃过多 → 黏连导致形状异常");
+            println!("   💡 建议: 放宽形状阈值或启用ROI分裂");
+        } else if shape_filtered_count >= 30 {
+            println!("   ✅ 诊断: 检测流程正常，4连通+形状筛选效果良好");
+        } else {
+            println!("   ⚠️ 诊断: 检测结果偏少，需要综合调优");
+        }
+        
+        Ok(centers)
+    }
+    
+    /// 合并两个检测结果并去重
+    fn merge_and_deduplicate(
+        &self, 
+        centers1: core::Vector<core::Point2f>, 
+        centers2: core::Vector<core::Point2f>
+    ) -> Result<core::Vector<core::Point2f>, opencv::Error> {
+        let mut merged = centers1.clone();
+        let d_nom = (self.expected_diameter_range.0 + self.expected_diameter_range.1) / 2.0; // ≈ 78.5
+        let min_distance = 0.5 * d_nom; // ≈ 39px，0.5*D_nom避免同圆重复
+        
+        for i in 0..centers2.len() {
+            let new_point = centers2.get(i)?;
+            let mut is_duplicate = false;
+            
+            // 检查是否与已有点重复
+            for j in 0..merged.len() {
+                let existing_point = merged.get(j)?;
+                let dx = new_point.x - existing_point.x;
+                let dy = new_point.y - existing_point.y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                
+                if distance < min_distance {
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            
+            if !is_duplicate {
+                merged.push(new_point);
+            }
+        }
+        
+        Ok(merged)
+    }
+    
+    /// ROI分裂处理：距离变换 + 局部极大值快分裂
+    fn process_roi_split_candidates(
+        &self,
+        image: &core::Mat,
+        binary: &core::Mat,
+        labels: &core::Mat,
+        stats: &core::Mat,
+        candidates: &[(i32, i32)]
+    ) -> Result<Vec<core::Point2f>, opencv::Error> {
+        let mut split_centers = Vec::new();
+        let d_nom = (self.expected_diameter_range.0 + self.expected_diameter_range.1) / 2.0; // ≈ 78.5
+        
+        for &(label_id, area) in candidates {
+            println!("   🔍 处理大连通域 #{}: 面积={}", label_id, area);
+            
+            // 获取该连通域的bbox
+            let x = *stats.at_2d::<i32>(label_id, imgproc::CC_STAT_LEFT)?;
+            let y = *stats.at_2d::<i32>(label_id, imgproc::CC_STAT_TOP)?;
+            let w = *stats.at_2d::<i32>(label_id, imgproc::CC_STAT_WIDTH)?;
+            let h = *stats.at_2d::<i32>(label_id, imgproc::CC_STAT_HEIGHT)?;
+            
+            let roi_rect = core::Rect::new(x, y, w, h);
+            println!("     📦 ROI区域: {}×{} at ({}, {})", w, h, x, y);
+            
+            // 提取ROI区域的二值掩膜
+            let roi_binary = core::Mat::roi(binary, roi_rect)?;
+            let roi_labels = core::Mat::roi(labels, roi_rect)?;
+            
+            // 创建该连通域的掩膜 (只保留当前label)
+            let mut roi_mask = core::Mat::default();
+            core::compare(&roi_labels, &core::Scalar::all(label_id as f64), &mut roi_mask, core::CMP_EQ)?;
+            
+            // 距离变换快分裂
+            let roi_centers = self.distance_transform_split(&roi_mask, area as f64, d_nom)?;
+            
+            // 将ROI坐标转换为全图坐标
+            for roi_center in roi_centers {
+                let global_center = core::Point2f::new(
+                    roi_center.x + x as f32,
+                    roi_center.y + y as f32
+                );
+                split_centers.push(global_center);
+            }
+        }
+        
+        Ok(split_centers)
+    }
+    
+    /// 距离变换 + 局部极大值分裂
+    fn distance_transform_split(
+        &self,
+        roi_mask: &core::Mat,
+        area: f64,
+        d_nom: f32
+    ) -> Result<Vec<core::Point2f>, opencv::Error> {
+        // 估计该ROI应包含的圆点数量 - 提高上限
+        let expected_area = std::f64::consts::PI * (d_nom as f64 / 2.0).powi(2); // ≈ 4840
+        let k_est_raw = (area / expected_area).round();
+        let k_est = k_est_raw.max(2.0).min(25.0) as usize; // 🔧 提高上限到25个，最少2个
+        
+        println!("     🎯 预估圆点数: {} (面积={:.0}, 单圆≈{:.0})", k_est, area, expected_area);
+        
+        // ✅ 直接对前景做距离变换 (不要bitwise_not!)
+        // OpenCV的distanceTransform对非零像素计算到最近0像素的距离
+        let mut dist = core::Mat::default();
+        imgproc::distance_transform(roi_mask, &mut dist, imgproc::DIST_L2, 3, core::CV_32F)?;
+        
+        // 获取距离变换的最大值
+        let mut min_val = 0.0;
+        let mut max_val = 0.0;
+        core::min_max_loc(&dist, Some(&mut min_val), Some(&mut max_val), None, None, &core::Mat::default())?;
+        
+        println!("     📏 距离变换范围: {:.1} - {:.1}", min_val, max_val);
+        
+        if max_val < 5.0 {
+            println!("     ⚠️ 距离变换值过小，跳过分裂");
+            return Ok(Vec::new());
+        }
+        
+        // 🔧 屏蔽ROI边框避免角点成为伪峰
+        let margin = (0.6 * d_nom) as i32;
+        let rows = dist.rows();
+        let cols = dist.cols();
+        
+        if margin < rows / 2 && margin < cols / 2 {
+            let zero_scalar = core::Scalar::all(0.0);
+            
+            // 使用rectangle函数填充边框区域为0
+            // 上边框
+            imgproc::rectangle(
+                &mut dist,
+                core::Rect::new(0, 0, cols, margin),
+                zero_scalar,
+                -1, // 填充
+                imgproc::LINE_8,
+                0
+            )?;
+            
+            // 下边框
+            imgproc::rectangle(
+                &mut dist,
+                core::Rect::new(0, rows - margin, cols, margin),
+                zero_scalar,
+                -1,
+                imgproc::LINE_8,
+                0
+            )?;
+            
+            // 左边框
+            imgproc::rectangle(
+                &mut dist,
+                core::Rect::new(0, 0, margin, rows),
+                zero_scalar,
+                -1,
+                imgproc::LINE_8,
+                0
+            )?;
+            
+            // 右边框
+            imgproc::rectangle(
+                &mut dist,
+                core::Rect::new(cols - margin, 0, margin, rows),
+                zero_scalar,
+                -1,
+                imgproc::LINE_8,
+                0
+            )?;
+            
+            println!("     🛡️ 已屏蔽边框 margin={} 避免角点伪峰", margin);
+        }
+        
+        // 🔧 局部极大值检测：使用更小的核减少耗时
+        let nms_radius = (0.4 * d_nom) as i32; // 🔧 从0.6减少到0.4，≈ 31px
+        let kernel_size = (nms_radius * 2 + 1).max(3).min(63); // 限制最大核尺寸
+        let kernel = imgproc::get_structuring_element(
+            imgproc::MORPH_ELLIPSE,
+            core::Size::new(kernel_size, kernel_size),
+            core::Point::new(-1, -1)
+        )?;
+        
+        println!("     🔧 NMS核尺寸: {}×{} (半径={})", kernel_size, kernel_size, nms_radius);
+        
+        let mut dilated = core::Mat::default();
+        imgproc::dilate(&dist, &mut dilated, &kernel, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+        
+        // 局部极大值 = 膨胀后与原图相等的点
+        let mut local_max = core::Mat::default();
+        core::compare(&dist, &dilated, &mut local_max, core::CMP_EQ)?;
+        
+        // 🔧 强度阈值：更保守的阈值避免噪声峰
+        let intensity_thresh = (0.3 * max_val).max(d_nom as f64 * 0.25); // 🔧 降低阈值系数
+        let mut strong_mask = core::Mat::default();
+        core::compare(&dist, &core::Scalar::all(intensity_thresh), &mut strong_mask, core::CMP_GT)?;
+        
+        // 结合局部极大值和强度阈值
+        let mut peaks = core::Mat::default();
+        core::bitwise_and(&local_max, &strong_mask, &mut peaks, &core::Mat::default())?;
+        
+        // 找到所有峰值点
+        let mut peak_locations = core::Vector::<core::Point>::new();
+        core::find_non_zero(&peaks, &mut peak_locations)?;
+        
+        println!("     🔍 找到 {} 个候选峰值", peak_locations.len());
+        
+        if peak_locations.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // 按距离变换值排序，取前k_est个
+        let mut peak_values = Vec::new();
+        for i in 0..peak_locations.len() {
+            let pt = peak_locations.get(i)?;
+            let dist_val = *dist.at_2d::<f32>(pt.y, pt.x)?;
+            peak_values.push((pt, dist_val));
+        }
+        
+        // 按距离值降序排序
+        peak_values.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        
+        // 取前k_est个峰值
+        let selected_peaks = peak_values.into_iter()
+            .take(k_est)
+            .collect::<Vec<_>>();
+        
+        println!("     ✅ 选择前 {} 个峰值作为圆心", selected_peaks.len());
+        
+        // 转换为Point2f并添加详细调试
+        let mut centers = Vec::new();
+        for (i, (pt, dist_val)) in selected_peaks.iter().enumerate() {
+            // 检查是否在边角 (调试用)
+            let near_edge = pt.x < margin || pt.y < margin || 
+                           pt.x >= (cols - margin) || pt.y >= (rows - margin);
+            let edge_flag = if near_edge { "⚠️边缘" } else { "✅内部" };
+            
+            println!("       峰值{}: ({}, {}) 强度={:.1} {}", 
+                    i+1, pt.x, pt.y, dist_val, edge_flag);
+            centers.push(core::Point2f::new(pt.x as f32, pt.y as f32));
+        }
+        
+        Ok(centers)
+    }
+    
+    /// 🚀 V3.2: 早停短路 + 廉价梯度计算（解决性能瓶颈）
+    /// 📌 回滚说明: 删除此函数和相关辅助函数及主函数调用即可回到背景平坦化版本
+    fn refine_centers_adaptive_v3(
+        &self,
+        image: &core::Mat,
+        centers: core::Vector<core::Point2f>
+    ) -> Result<(core::Vector<core::Point2f>, Vec<RefineTag>), opencv::Error> {
+        let mut refined = core::Vector::<core::Point2f>::new();
+        let mut tags = Vec::<RefineTag>::new(); // 🎨 记录每个点的细化来源
+        
+        let d_nom = (self.expected_diameter_range.0 + self.expected_diameter_range.1) / 2.0; // ≈78.5
+        
+        // 🚀 预计算结构（一次生成，40次复用）
+        let pc = Precomputed::new(d_nom as f32)?;
+        
+        // 🚀 全帧一次性Scharr |∇I| 与1/2尺度金字塔（供低亮点用）
+        let (grad_mag, grad_mag_pyr) = Self::precompute_gradients(image)?; // 只做一次
+        
+        let mut n_high = 0;
+        let mut n_low = 0;
+        let mut n_fallback = 0;
+        
+        println!("   📏 V3.2早停短路: ROI={}×{}, r0={:.1}, 预计算完成",
+                pc.roi_side, pc.roi_side, pc.r0);
+        
+        for i in 0..centers.len() {
+            let c0 = centers.get(i)?;
+            let rr = Self::roi_at(c0, pc.roi_side, image.cols(), image.rows());
+            let roi_gray = core::Mat::roi(image, rr)?.try_clone()?;
+            
+            // —— 🚀 亮度快门：通过即直接DT-only；不算梯度 ——
+            if Self::brightness_gate_fast(&roi_gray, pc.r0)? {
+                let c = Self::refine_dt_fast_reuse(&roi_gray, rr, &pc.kernel3, pc.r0)?;
+                Self::push_with_guard(c0, c, pc.r0 * 0.7, &mut refined, &mut tags, &mut n_fallback, RefineTag::Hi);
+                n_high += 1;
+                continue; // **短路：不算任何梯度置信**
+            }
+            
+            // —— 🚀 只到这里的点才去算梯度置信（在1/2尺度上）——
+            let rr_half = Self::rect_half(rr);
+            let roi_gm_half = core::Mat::roi(&grad_mag_pyr, rr_half)?.try_clone()?;
+            let ec = Self::edge_conf_hist_p90(&roi_gm_half, &pc.mask_edgeband, &pc.mask_outer)?;
+            
+            if ec >= 2.0 {
+                let c = Self::refine_dt_fast_reuse(&roi_gray, rr, &pc.kernel3, pc.r0)?;
+                Self::push_with_guard(c0, c, pc.r0 * 0.7, &mut refined, &mut tags, &mut n_fallback, RefineTag::Hi);
+                n_high += 1;
+            } else {
+                // 🚀 低置信：径向采样Pratt（保持现有实现，但用pc.polar，步长0.8）
+                let (ok, c) = Self::refine_dark_radial_fit_fast(&roi_gray, rr, &pc.polar, 0.85 * pc.r0, 1.15 * pc.r0, pc.r0, 0.8)?;
+                if ok {
+                    Self::push_with_guard(c0, c, pc.r0 * 0.7, &mut refined, &mut tags, &mut n_fallback, RefineTag::Lo);
+                } else {
+                    refined.push(c0);
+                    tags.push(RefineTag::Fallback);
+                    n_fallback += 1;
+                }
+                n_low += 1;
+            }
+        }
+        
+        println!("   📊 V3.2早停细化: 高置信(DT-only)={} 个, 低置信(径向采样)={} 个, 回退={} 个",
+                n_high, n_low, n_fallback);
+        Ok((refined, tags))
+    }
+    
+    /// 🆕 V2: 轻量级自适应圆心细化 - 基于SNR和过曝比例的分支策略 (已弃用，保留供参考)
+    /// 📌 回滚说明: 删除此函数和主函数中的调用即可回到背景平坦化版本
+    #[allow(dead_code)]
+    fn refine_centers_adaptive_v2(
+        &self,
+        image: &core::Mat,
+        centers: core::Vector<core::Point2f>
+    ) -> Result<core::Vector<core::Point2f>, opencv::Error> {
+        let mut refined_centers = core::Vector::<core::Point2f>::new();
+        let d_nom = (self.expected_diameter_range.0 + self.expected_diameter_range.1) / 2.0; // ≈ 78.5
+        
+        // 🔧 V2优化: ROI尺寸 = 1.6*D_nom，确保完整包含圆点
+        let roi_size = ((1.6 * d_nom) as i32).clamp(96, 160); // ≈ 125px
+        
+        // 定义三个半径用于SNR计算
+        let r_in = 0.45 * d_nom;   // 内盘半径 ≈ 35px
+        let r_mid = 0.65 * d_nom;  // 环形内径 ≈ 51px  
+        let r_out = 0.90 * d_nom;  // 环形外径 ≈ 71px
+        
+        let mut bright_count = 0;  // SNR>=8 或 过曝>2%
+        let mut dark_count = 0;    // SNR<=4
+        let mut mid_count = 0;     // 4<SNR<8
+        let mut fallback_count = 0; // 细化失败回退
+        
+        println!("   📏 ROI尺寸: {}×{}, 半径: r_in={:.1}, r_mid={:.1}, r_out={:.1}", 
+                roi_size, roi_size, r_in, r_mid, r_out);
+        
+        for i in 0..centers.len() {
+            let center = centers.get(i)?;
+            let x0 = ((center.x as i32) - roi_size / 2).clamp(0, image.cols() - roi_size);
+            let y0 = ((center.y as i32) - roi_size / 2).clamp(0, image.rows() - roi_size);
+            
+            let roi_rect = core::Rect::new(x0, y0, roi_size, roi_size);
+            let roi = core::Mat::roi(image, roi_rect)?.try_clone()?;
+            
+            // 🔍 计算局部SNR和过曝比例
+            let (snr, sat_ratio) = self.calculate_local_snr_and_saturation(&roi, r_in, r_mid, r_out)?;
+            
+            // 🎯 自适应分支选择 (不使用固定120阈值)
+            let refined_center = if sat_ratio > 0.02 || snr >= 8.0 {
+                // 明亮/过曝型: 使用距离变换峰值细化
+                bright_count += 1;
+                self.refine_bright_adaptive_dt(&roi, roi_rect, center, r_in, r_mid, r_out)?
+            } else if snr <= 4.0 {
+                // 暗/低对比型: 使用边界拟合细化
+                dark_count += 1;
+                self.refine_dark_adaptive_edge(&roi, roi_rect, center, r_mid, r_out)?
+            } else {
+                // 中间地带: 使用距离变换 (更稳定)
+                mid_count += 1;
+                self.refine_bright_adaptive_dt(&roi, roi_rect, center, r_in, r_mid, r_out)?
+            };
+            
+            // 🛡️ 位移约束: |Δ| > 0.35*D 则回退到原坐标
+            let displacement = ((refined_center.x - center.x).powi(2) + (refined_center.y - center.y).powi(2)).sqrt();
+            let max_displacement = 0.35 * d_nom;
+            
+            if displacement <= max_displacement {
+                refined_centers.push(refined_center);
+            } else {
+                refined_centers.push(center); // 回退到原坐标
+                fallback_count += 1;
+            }
+        }
+        
+        println!("   📊 细化统计: 明亮型{}个, 暗部型{}个, 中间型{}个, 回退{}个", 
+                bright_count, dark_count, mid_count, fallback_count);
+        
+        Ok(refined_centers)
+    }
+    
+    /// 🔍 计算局部SNR和过曝比例
+    fn calculate_local_snr_and_saturation(
+        &self,
+        roi: &core::Mat,
+        r_in: f32,
+        r_mid: f32, 
+        r_out: f32
+    ) -> Result<(f64, f64), opencv::Error> {
+        let roi_center = core::Point2f::new(roi.cols() as f32 * 0.5, roi.rows() as f32 * 0.5);
+        
+        // 创建内盘掩膜
+        let mut in_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut in_mask, 
+            core::Point::new(roi_center.x as i32, roi_center.y as i32),
+            r_in as i32, 
+            core::Scalar::all(255.0), 
+            -1, imgproc::LINE_8, 0)?;
+        
+        // 创建环形掩膜 (r_mid ~ r_out)
+        let mut ring_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut ring_mask,
+            core::Point::new(roi_center.x as i32, roi_center.y as i32),
+            r_out as i32,
+            core::Scalar::all(255.0),
+            -1, imgproc::LINE_8, 0)?;
+        imgproc::circle(&mut ring_mask,
+            core::Point::new(roi_center.x as i32, roi_center.y as i32),
+            r_mid as i32,
+            core::Scalar::all(0.0),
+            -1, imgproc::LINE_8, 0)?;
+        
+        // 计算内盘和环形区域的统计量
+        let mu_in = core::mean(roi, &in_mask)?;
+        let mu_ring = core::mean(roi, &ring_mask)?;
+        
+        let mut std_dev = core::Scalar::default();
+        let mut mean_val = core::Scalar::default();
+        core::mean_std_dev(roi, &mut mean_val, &mut std_dev, &ring_mask)?;
+        let sigma_ring = std_dev[0];
+        
+        // 计算SNR
+        let snr = (mu_in[0] - mu_ring[0]) / sigma_ring.max(1.0);
+        
+        // 计算过曝比例 (>=250的像素在内盘中的比例)
+        let mut sat_mask = core::Mat::default();
+        imgproc::threshold(roi, &mut sat_mask, 250.0, 255.0, imgproc::THRESH_BINARY)?;
+        let mut sat_in_mask = core::Mat::default();
+        core::bitwise_and(&sat_mask, &in_mask, &mut sat_in_mask, &core::Mat::default())?;
+        
+        let sat_pixels = core::count_non_zero(&sat_in_mask)?;
+        let total_in_pixels = core::count_non_zero(&in_mask)?.max(1);
+        let sat_ratio = sat_pixels as f64 / total_in_pixels as f64;
+        
+        Ok((snr, sat_ratio))
+    }
+    
+    /// 🔆 明亮型圆点细化: 局部自适应阈值 + 距离变换峰值
+    fn refine_bright_adaptive_dt(
+        &self,
+        roi: &core::Mat,
+        roi_rect: core::Rect,
+        original_center: core::Point2f,
+        r_in: f32,
+        r_mid: f32,
+        r_out: f32
+    ) -> Result<core::Point2f, opencv::Error> {
+        let roi_center = core::Point2f::new(roi.cols() as f32 * 0.5, roi.rows() as f32 * 0.5);
+        
+        // 计算局部自适应阈值 (不使用全局阈值)
+        let mu_in = {
+            let mut in_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+            imgproc::circle(&mut in_mask, 
+                core::Point::new(roi_center.x as i32, roi_center.y as i32),
+                r_in as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+            core::mean(roi, &in_mask)?[0]
+        };
+        
+        let mu_ring = {
+            let mut ring_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+            imgproc::circle(&mut ring_mask,
+                core::Point::new(roi_center.x as i32, roi_center.y as i32),
+                r_out as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+            imgproc::circle(&mut ring_mask,
+                core::Point::new(roi_center.x as i32, roi_center.y as i32),
+                r_mid as i32, core::Scalar::all(0.0), -1, imgproc::LINE_8, 0)?;
+            core::mean(roi, &ring_mask)?[0]
+        };
+        
+        let t_local = mu_ring + 0.5 * (mu_in - mu_ring);
+        
+        // 二值化 + 轻微腐蚀
+        let mut binary = core::Mat::default();
+        imgproc::threshold(roi, &mut binary, t_local, 255.0, imgproc::THRESH_BINARY)?;
+        
+        let kernel = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(3, 3), core::Point::new(-1, -1))?;
+        let mut eroded = core::Mat::default();
+        imgproc::erode(&binary, &mut eroded, &kernel, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+        let binary = eroded; // 重新绑定
+        
+        // 距离变换
+        let mut dist = core::Mat::default();
+        imgproc::distance_transform(&binary, &mut dist, imgproc::DIST_L2, 3, core::CV_32F)?;
+        
+        // 在峰值搜索掩膜内找最大值 (半径 ≈ 0.8*r_in)
+        let mut peak_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        let search_radius = (0.8 * r_in) as i32;
+        imgproc::circle(&mut peak_mask,
+            core::Point::new(roi_center.x as i32, roi_center.y as i32),
+            search_radius, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        
+        let mut min_val = 0.0;
+        let mut max_val = 0.0;
+        let mut min_loc = core::Point::default();
+        let mut max_loc = core::Point::default();
+        core::min_max_loc(&dist, Some(&mut min_val), Some(&mut max_val), Some(&mut min_loc), Some(&mut max_loc), &peak_mask)?;
+        
+        if max_val > 3.0 {
+            // 亚像素峰值细化 (简单的0.5像素偏移)
+            let refined_x = max_loc.x as f32 + 0.5;
+            let refined_y = max_loc.y as f32 + 0.5;
+            
+            Ok(core::Point2f::new(
+                roi_rect.x as f32 + refined_x,
+                roi_rect.y as f32 + refined_y
+            ))
+        } else {
+            Ok(original_center)
+        }
+    }
+    
+    /// 🌑 暗部型圆点细化: 归一化 + 环域约束Canny + 圆拟合
+    fn refine_dark_adaptive_edge(
+        &self,
+        roi: &core::Mat,
+        roi_rect: core::Rect,
+        original_center: core::Point2f,
+        r_mid: f32,
+        r_out: f32
+    ) -> Result<core::Point2f, opencv::Error> {
+        let roi_center = core::Point2f::new(roi.cols() as f32 * 0.5, roi.rows() as f32 * 0.5);
+        
+        // 线性归一化到[0,255]
+        let mut normalized = core::Mat::default();
+        core::normalize(roi, &mut normalized, 0.0, 255.0, core::NORM_MINMAX, core::CV_8U, &core::Mat::default())?;
+        
+        // 🔧 正确使用gaussian_blur: 使用Size(5,5)替代Size(0,0)
+        let mut blurred = core::Mat::default();
+        imgproc::gaussian_blur(&normalized, &mut blurred, core::Size::new(5, 5), 1.2, 1.2, core::BORDER_DEFAULT, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        
+        // Canny边缘检测 (固定小阈值)
+        let mut edges = core::Mat::default();
+        imgproc::canny(&blurred, &mut edges, 12.0, 36.0, 3, false)?;
+        
+        // 环域约束: 只在r_mid~r_out环形区域内保留边缘
+        let mut ring_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut ring_mask,
+            core::Point::new(roi_center.x as i32, roi_center.y as i32),
+            r_out as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        imgproc::circle(&mut ring_mask,
+            core::Point::new(roi_center.x as i32, roi_center.y as i32),
+            r_mid as i32, core::Scalar::all(0.0), -1, imgproc::LINE_8, 0)?;
+        
+        let mut masked_edges = core::Mat::default();
+        core::bitwise_and(&edges, &ring_mask, &mut masked_edges, &core::Mat::default())?;
+        let edges = masked_edges; // 重新绑定
+        
+        // 查找轮廓并拟合圆
+        let mut contours = core::Vector::<core::Vector<core::Point>>::new();
+        imgproc::find_contours(&edges, &mut contours, imgproc::RETR_LIST, imgproc::CHAIN_APPROX_NONE, core::Point::default())?;
+        
+        if contours.len() == 0 {
+            return Ok(original_center);
+        }
+        
+        // 找到最长轮廓
+        let mut max_length = 0;
+        let mut best_contour_idx = 0;
+        for i in 0..contours.len() {
+            let contour = contours.get(i)?;
+            if contour.len() > max_length {
+                max_length = contour.len();
+                best_contour_idx = i;
+            }
+        }
+        
+        if max_length < 20 {
+            return Ok(original_center);
+        }
+        
+        // 最小外接圆拟合
+        let best_contour = contours.get(best_contour_idx)?;
+        let mut center = core::Point2f::default();
+        let mut radius = 0.0;
+        imgproc::min_enclosing_circle(&best_contour, &mut center, &mut radius)?;
+        
+        // 转换为全图坐标
+        Ok(core::Point2f::new(
+            roi_rect.x as f32 + center.x,
+            roi_rect.y as f32 + center.y
+        ))
+    }
+    
+    /// 🚀 V3.1: 修正边缘置信度 - 窄边带高分位 / 外环噪声MAD (已弃用)
+    #[allow(dead_code)]
+    fn edge_confidence_v2(
+        roi: &core::Mat,
+        r0: f32,                // 预期半径 ~ D_nom/2
+        band_halfw: i32,        // 窄边带半宽
+        outer_w: i32,           // 外环宽
+    ) -> Result<f64, opencv::Error> {
+        // 1) Scharr梯度幅值
+        let mut gx = core::Mat::default();
+        let mut gy = core::Mat::default();
+        imgproc::scharr(roi, &mut gx, core::CV_32F, 1, 0, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        imgproc::scharr(roi, &mut gy, core::CV_32F, 0, 1, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        
+        let mut mag = core::Mat::default();
+        core::magnitude(&gx, &gy, &mut mag)?;
+        
+        let cx = roi.cols() as f32 * 0.5;
+        let cy = roi.rows() as f32 * 0.5;
+        
+        // 2) 采样函数：把mask圆环内像素的mag拉成Vec<f32>
+        let mut edge_band = Vec::<f32>::new();
+        let mut noise_band = Vec::<f32>::new();
+        let (rb0, rb1) = (r0 - band_halfw as f32, r0 + band_halfw as f32);
+        let (rn0, rn1) = (r0 + 6.0, r0 + 6.0 + outer_w as f32); // 外环偏移6px
+        
+        for y in 0..roi.rows() {
+            for x in 0..roi.cols() {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                let v = *mag.at_2d::<f32>(y, x)?;
+                if r >= rb0 && r <= rb1 {
+                    edge_band.push(v);
+                } else if r >= rn0 && r <= rn1 {
+                    noise_band.push(v);
+                }
+            }
+        }
+        
+        if edge_band.is_empty() || noise_band.is_empty() {
+            return Ok(0.0);
+        }
+        
+        // 3) 信号：P90（或Top-15%均值）
+        edge_band.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p90_idx = (edge_band.len() as f32 * 0.9) as usize;
+        let p90 = edge_band[p90_idx.min(edge_band.len() - 1)];
+        
+        // 4) 噪声：MAD→σ
+        let (_, mad) = Self::median_and_mad(&noise_band);
+        let sigma = (mad * 1.4826).max(1e-3);
+        
+        Ok((p90 as f64) / (sigma as f64))
+    }
+    
+    /// 🚀 V3.1: 亮度快门 - 高对比/过曝直接走高置信
+    fn quick_brightness_gate(
+        roi: &core::Mat,
+        r_in: f32,
+        r_ring0: f32,
+        r_ring1: f32,
+    ) -> Result<bool, opencv::Error> {
+        let (mu_in, mu_ring, sigma_ring) = Self::mean_and_sigma_in_ring(roi, r_in, r_ring0, r_ring1)?;
+        let snr_i = (mu_in - mu_ring) / sigma_ring.max(1.0);
+        
+        // 内盘过曝比例（>=250）
+        let sat = Self::saturation_ratio_in_disk(roi, r_in)?;
+        
+        Ok(sat > 0.02 || snr_i >= 6.0)
+    }
+    
+    /// 🚀 V3.1: 计算环域内的均值和标准差
+    fn mean_and_sigma_in_ring(
+        roi: &core::Mat,
+        r_in: f32,
+        r_ring0: f32,
+        r_ring1: f32,
+    ) -> Result<(f64, f64, f64), opencv::Error> {
+        let cx = roi.cols() as f32 * 0.5;
+        let cy = roi.rows() as f32 * 0.5;
+        
+        let mut in_vals = Vec::<f32>::new();
+        let mut ring_vals = Vec::<f32>::new();
+        
+        for y in 0..roi.rows() {
+            for x in 0..roi.cols() {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                let v = *roi.at_2d::<u8>(y, x)? as f32;
+                
+                if r <= r_in {
+                    in_vals.push(v);
+                } else if r >= r_ring0 && r <= r_ring1 {
+                    ring_vals.push(v);
+                }
+            }
+        }
+        
+        let mu_in = if in_vals.is_empty() { 0.0 } else { 
+            in_vals.iter().sum::<f32>() / in_vals.len() as f32 
+        } as f64;
+        
+        let mu_ring = if ring_vals.is_empty() { 0.0 } else { 
+            ring_vals.iter().sum::<f32>() / ring_vals.len() as f32 
+        } as f64;
+        
+        let sigma_ring = if ring_vals.len() < 2 { 1.0 } else {
+            let mean = mu_ring as f32;
+            let variance = ring_vals.iter()
+                .map(|v| (v - mean).powi(2))
+                .sum::<f32>() / (ring_vals.len() - 1) as f32;
+            variance.sqrt() as f64
+        };
+        
+        Ok((mu_in, mu_ring, sigma_ring))
+    }
+    
+    /// 🚀 V3.1: 计算圆盘内过曝比例
+    fn saturation_ratio_in_disk(roi: &core::Mat, r_in: f32) -> Result<f64, opencv::Error> {
+        let cx = roi.cols() as f32 * 0.5;
+        let cy = roi.rows() as f32 * 0.5;
+        
+        let mut total_pixels = 0;
+        let mut sat_pixels = 0;
+        
+        for y in 0..roi.rows() {
+            for x in 0..roi.cols() {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                
+                if r <= r_in {
+                    total_pixels += 1;
+                    let v = *roi.at_2d::<u8>(y, x)?;
+                    if v >= 250 {
+                        sat_pixels += 1;
+                    }
+                }
+            }
+        }
+        
+        if total_pixels == 0 {
+            Ok(0.0)
+        } else {
+            Ok(sat_pixels as f64 / total_pixels as f64)
+        }
+    }
+    
+    /// 🚀 V3.2: 全帧预计算梯度
+    fn precompute_gradients(gray: &core::Mat) -> Result<(core::Mat, core::Mat), opencv::Error> {
+        let mut gx = core::Mat::default();
+        let mut gy = core::Mat::default();
+        imgproc::scharr(gray, &mut gx, core::CV_32F, 1, 0, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        imgproc::scharr(gray, &mut gy, core::CV_32F, 0, 1, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        
+        let mut mag = core::Mat::default();
+        core::magnitude(&gx, &gy, &mut mag)?;
+        
+        // 1/2尺度（pyrDown），供统计使用
+        let mut mag_half = core::Mat::default();
+        imgproc::pyr_down(&mag, &mut mag_half, core::Size::default(), core::BORDER_DEFAULT)?;
+        
+        Ok((mag, mag_half))
+    }
+    
+    /// 🚀 V3.2: 亮度快门（轻量、无梯度）
+    fn brightness_gate_fast(roi: &core::Mat, r0: f32) -> Result<bool, opencv::Error> {
+        let cx = roi.cols() as f32 * 0.5;
+        let cy = roi.rows() as f32 * 0.5;
+        
+        // 内盘
+        let mut m_in = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut m_in, core::Point::new(cx as i32, cy as i32), (0.8 * r0) as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        
+        // 环域：r0..1.3r0
+        let mut m_ring = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut m_ring, core::Point::new(cx as i32, cy as i32), (1.3 * r0) as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        imgproc::circle(&mut m_ring, core::Point::new(cx as i32, cy as i32), (1.0 * r0) as i32, core::Scalar::all(0.0), -1, imgproc::LINE_8, 0)?;
+        
+        let mu_in = core::mean(roi, &m_in)?[0];
+        let mu_ring = core::mean(roi, &m_ring)?[0];
+        
+        let mut mean_v = core::Scalar::default();
+        let mut std_v = core::Scalar::default();
+        core::mean_std_dev(roi, &mut mean_v, &mut std_v, &m_ring)?;
+        let sigma_ring = std_v[0].max(1.0);
+        
+        // 过曝比例（>=250）
+        let mut sat = core::Mat::default();
+        imgproc::threshold(roi, &mut sat, 250.0, 255.0, imgproc::THRESH_BINARY)?;
+        let mut sat_in = core::Mat::default();
+        core::bitwise_and(&sat, &m_in, &mut sat_in, &core::Mat::default())?;
+        let sat_ratio = (core::count_non_zero(&sat_in)? as f64) / (core::count_non_zero(&m_in)? as f64).max(1.0);
+        
+        let snr = (mu_in - mu_ring) / sigma_ring;
+        Ok(sat_ratio > 0.02 || snr >= 6.0)
+    }
+    
+    /// 🚀 V3.2: 近似P90：用32bin直方图+掩膜（环带/外环分别统计）
+    fn edge_conf_hist_p90(
+        roi_grad_half: &core::Mat,
+        mask_edgeband_full: &core::Mat,
+        mask_outer_full: &core::Mat,
+    ) -> Result<f64, opencv::Error> {
+        // 注意：ROI在1/2尺度上，掩膜需同步resize一次
+        let mut mask_edge_half = core::Mat::default();
+        let mut mask_outer_half = core::Mat::default();
+        imgproc::resize(mask_edgeband_full, &mut mask_edge_half, roi_grad_half.size()?, 0.0, 0.0, imgproc::INTER_NEAREST)?;
+        imgproc::resize(mask_outer_full, &mut mask_outer_half, roi_grad_half.size()?, 0.0, 0.0, imgproc::INTER_NEAREST)?;
+        
+        // (1) edge band直方图 -> P90
+        let hist_size = core::Vector::<i32>::from(vec![32]);
+        let ranges = core::Vector::<f32>::from(vec![0f32, 255f32]);
+        let channels = core::Vector::<i32>::from(vec![0]);
+        let mut hist = core::Mat::default();
+        let images = core::Vector::<core::Mat>::from(vec![roi_grad_half.clone()]);
+        imgproc::calc_hist(&images, &channels, &mask_edge_half, &mut hist, &hist_size, &ranges, false)?;
+        
+        let total = core::sum_elems(&hist)?[0] as f32;
+        let mut acc = 0f32;
+        let mut p90_bin = 31;
+        for b in 0..32 {
+            acc += *hist.at::<f32>(b)?;
+            if acc >= 0.9 * total {
+                p90_bin = b;
+                break;
+            }
+        }
+        let p90 = (p90_bin as f32 + 0.5) * (255.0 / 32.0);
+        
+        // (2) 外环stddev（足够快）
+        let mut mean_v = core::Scalar::default();
+        let mut std_v = core::Scalar::default();
+        core::mean_std_dev(roi_grad_half, &mut mean_v, &mut std_v, &mask_outer_half)?;
+        let sigma = std_v[0].max(1e-3);
+        
+        Ok((p90 as f64) / sigma)
+    }
+    
+    /// 🚀 V3.2: 快速DT细化（复用已有实现；确保轻量）
+    fn refine_dt_fast_reuse(
+        roi_gray: &core::Mat,
+        rr: core::Rect,
+        kernel3: &core::Mat,
+        r0: f32,
+    ) -> Result<core::Point2f, opencv::Error> {
+        // 用"局部阈值 t_local = (mu_in + mu_ring)/2"即可；避免多次掩膜统计
+        let t_local = {
+            let mut mean_all = core::Scalar::default();
+            let mut std_all = core::Scalar::default();
+            core::mean_std_dev(roi_gray, &mut mean_all, &mut std_all, &core::Mat::default())?;
+            mean_all[0] + 0.25 * std_all[0] // 非常快的近似门限
+        };
+        
+        let mut bin = core::Mat::default();
+        imgproc::threshold(roi_gray, &mut bin, t_local, 255.0, imgproc::THRESH_BINARY)?;
+        let mut eroded = core::Mat::default();
+        imgproc::erode(&bin, &mut eroded, kernel3, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+        
+        let mut dist = core::Mat::default();
+        imgproc::distance_transform(&eroded, &mut dist, imgproc::DIST_L2, 3, core::CV_32F)?;
+        
+        // 峰值 + 3×3二次曲面
+        let mut max_val = 0.0;
+        let mut max_loc = core::Point::default();
+        core::min_max_loc(&dist, None, Some(&mut max_val), None, Some(&mut max_loc), &core::Mat::default())?;
+        
+        let (sx, sy) = Self::quadfit_subpixel_3x3(&dist, max_loc)?;
+        Ok(core::Point2f::new(rr.x as f32 + sx, rr.y as f32 + sy))
+    }
+    
+    /// 🚀 V3.2: ROI计算辅助函数
+    fn roi_at(c0: core::Point2f, roi_side: i32, img_cols: i32, img_rows: i32) -> core::Rect {
+        let x0 = ((c0.x as i32) - roi_side / 2).clamp(0, img_cols - roi_side);
+        let y0 = ((c0.y as i32) - roi_side / 2).clamp(0, img_rows - roi_side);
+        core::Rect::new(x0, y0, roi_side, roi_side)
+    }
+    
+    /// 🚀 V3.2: 1/2尺度ROI计算
+    fn rect_half(rr: core::Rect) -> core::Rect {
+        core::Rect::new(rr.x / 2, rr.y / 2, rr.width / 2, rr.height / 2)
+    }
+    
+    /// 🚀 V3.2: 位移保护（内联优化）
+    fn push_with_guard(
+        c0: core::Point2f,
+        c: core::Point2f,
+        max_disp: f32,
+        out: &mut core::Vector<core::Point2f>,
+        tags: &mut Vec<RefineTag>,
+        n_fb: &mut i32,
+        tag: RefineTag,
+    ) {
+        let d = ((c.x - c0.x).powi(2) + (c.y - c0.y).powi(2)).sqrt();
+        if d > max_disp {
+            out.push(c0);
+            tags.push(RefineTag::Fallback);
+            *n_fb += 1;
+        } else {
+            out.push(c);
+            tags.push(tag);
+        }
+    }
+    
+    /// 🚀 V3: 提取掩膜区域的像素值
+    fn masked_values_f32(mat: &core::Mat, mask: &core::Mat) -> Result<Vec<f32>, opencv::Error> {
+        let mut vals = Vec::new();
+        for y in 0..mat.rows() {
+            for x in 0..mat.cols() {
+                if *mask.at_2d::<u8>(y, x)? != 0 {
+                    vals.push(*mat.at_2d::<f32>(y, x)?);
+                }
+            }
+        }
+        Ok(vals)
+    }
+    
+    /// 🚀 V3: 计算中位数和MAD
+    fn median_and_mad(vals: &[f32]) -> (f32, f32) {
+        if vals.is_empty() {
+            return (0.0, 0.0);
+        }
+        
+        let mut sorted = vals.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        let med = sorted[sorted.len() / 2];
+        
+        // MAD
+        let mut dev: Vec<f32> = sorted.iter().map(|v| (v - med).abs()).collect();
+        dev.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mad = dev[dev.len() / 2];
+        
+        (med, mad)
+    }
+    
+    /// 🚀 V3: 高置信DT-only细化（极快）
+    fn refine_bright_fast_dt(
+        roi: &core::Mat,
+        masks: &PrecomputedMasks,
+        se3: &core::Mat,
+        roi_rect: core::Rect,
+        c0: core::Point2f,
+        rin: f32,
+    ) -> Result<core::Point2f, opencv::Error> {
+        // 局部阈值：用环域与内盘均值的中点（掩膜复用）
+        let mu_in = core::mean(roi, &masks.inner_mask_u8)?[0];
+        let mu_ring = core::mean(roi, &masks.ring_mask_u8)?[0];
+        let t = mu_ring + 0.5 * (mu_in - mu_ring);
+        
+        let mut bw = core::Mat::default();
+        imgproc::threshold(roi, &mut bw, t, 255.0, imgproc::THRESH_BINARY)?;
+        
+        let mut bw_erode = core::Mat::default();
+        imgproc::erode(&bw, &mut bw_erode, se3, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+        
+        let mut dist = core::Mat::default();
+        imgproc::distance_transform(&bw_erode, &mut dist, imgproc::DIST_L2, 3, core::CV_32F)?;
+        
+        // 仅在中心小圆内找峰值（避免噪声）：半径≈0.8*rin
+        let mut peak_mask = core::Mat::default();
+        masks.center_mask(&mut peak_mask)?;
+        
+        let (pv, pl) = Self::max_loc_masked_32f(&dist, &peak_mask)?;
+        
+        if pv <= 2.0 {
+            return Ok(c0); // 很淡直接回退
+        }
+        
+        // 🚀 3×3二次曲面亚像素拟合（极快）
+        let (subx, suby) = Self::quadfit_subpixel_3x3(&dist, pl)?;
+        Ok(core::Point2f::new(roi_rect.x as f32 + subx, roi_rect.y as f32 + suby))
+    }
+    
+    /// 🚀 V3: 掩膜区域内找最大值和位置
+    fn max_loc_masked_32f(mat: &core::Mat, mask: &core::Mat) -> Result<(f32, core::Point), opencv::Error> {
+        let mut max_val = 0.0f32;
+        let mut max_loc = core::Point::new(0, 0);
+        
+        for y in 0..mat.rows() {
+            for x in 0..mat.cols() {
+                if *mask.at_2d::<u8>(y, x)? != 0 {
+                    let val = *mat.at_2d::<f32>(y, x)?;
+                    if val > max_val {
+                        max_val = val;
+                        max_loc = core::Point::new(x, y);
+                    }
+                }
+            }
+        }
+        
+        Ok((max_val, max_loc))
+    }
+    
+    /// 🚀 V3: 3×3二次曲面亚像素拟合
+    fn quadfit_subpixel_3x3(mat: &core::Mat, center: core::Point) -> Result<(f32, f32), opencv::Error> {
+        let x = center.x;
+        let y = center.y;
+        
+        // 边界检查
+        if x < 1 || y < 1 || x >= mat.cols() - 1 || y >= mat.rows() - 1 {
+            return Ok((x as f32, y as f32));
+        }
+        
+        // 3×3邻域
+        let f00 = *mat.at_2d::<f32>(y - 1, x - 1)?;
+        let f01 = *mat.at_2d::<f32>(y - 1, x)?;
+        let f02 = *mat.at_2d::<f32>(y - 1, x + 1)?;
+        let f10 = *mat.at_2d::<f32>(y, x - 1)?;
+        let f11 = *mat.at_2d::<f32>(y, x)?;
+        let f12 = *mat.at_2d::<f32>(y, x + 1)?;
+        let f20 = *mat.at_2d::<f32>(y + 1, x - 1)?;
+        let f21 = *mat.at_2d::<f32>(y + 1, x)?;
+        let f22 = *mat.at_2d::<f32>(y + 1, x + 1)?;
+        
+        // 二阶导数
+        let fxx = f10 - 2.0 * f11 + f12;
+        let fyy = f01 - 2.0 * f11 + f21;
+        let fxy = 0.25 * (f00 - f02 - f20 + f22);
+        
+        // 一阶导数
+        let fx = 0.5 * (f12 - f10);
+        let fy = 0.5 * (f21 - f01);
+        
+        // 求解亚像素偏移
+        let det = fxx * fyy - fxy * fxy;
+        if det.abs() < 1e-6 {
+            return Ok((x as f32, y as f32));
+        }
+        
+        let dx = -(fyy * fx - fxy * fy) / det;
+        let dy = -(fxx * fy - fxy * fx) / det;
+        
+        // 限制偏移范围
+        let dx = dx.clamp(-0.5, 0.5);
+        let dy = dy.clamp(-0.5, 0.5);
+        
+        Ok((x as f32 + dx, y as f32 + dy))
+    }
+    
+    /// 🚀 V3.1: 简化DT-only细化（无预计算掩膜）
+    fn refine_bright_fast_dt_v31(
+        roi: &core::Mat,
+        roi_rect: core::Rect,
+        r0: f32,
+    ) -> Result<core::Point2f, opencv::Error> {
+        let cx = roi.cols() as f32 * 0.5;
+        let cy = roi.rows() as f32 * 0.5;
+        
+        // 局部阈值：内盘与环域均值的中点
+        let (mu_in, mu_ring, _) = Self::mean_and_sigma_in_ring(roi, 0.8 * r0, 1.0 * r0, 1.3 * r0)?;
+        let t = mu_ring + 0.5 * (mu_in - mu_ring);
+        
+        let mut bw = core::Mat::default();
+        imgproc::threshold(roi, &mut bw, t, 255.0, imgproc::THRESH_BINARY)?;
+        
+        // 轻微腐蚀
+        let se3 = imgproc::get_structuring_element(imgproc::MORPH_ELLIPSE, core::Size::new(3, 3), core::Point::new(-1, -1))?;
+        let mut bw_erode = core::Mat::default();
+        imgproc::erode(&bw, &mut bw_erode, &se3, core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+        
+        let mut dist = core::Mat::default();
+        imgproc::distance_transform(&bw_erode, &mut dist, imgproc::DIST_L2, 3, core::CV_32F)?;
+        
+        // 在中心小圆内找峰值
+        let search_r = (0.8 * r0) as i32;
+        let mut max_val = 0.0f32;
+        let mut max_loc = core::Point::new(cx as i32, cy as i32);
+        
+        for y in ((cy as i32) - search_r).max(0)..((cy as i32) + search_r).min(roi.rows()) {
+            for x in ((cx as i32) - search_r).max(0)..((cx as i32) + search_r).min(roi.cols()) {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                if dx * dx + dy * dy <= (search_r as f32).powi(2) {
+                    let val = *dist.at_2d::<f32>(y, x)?;
+                    if val > max_val {
+                        max_val = val;
+                        max_loc = core::Point::new(x, y);
+                    }
+                }
+            }
+        }
+        
+        if max_val <= 2.0 {
+            return Ok(core::Point2f::new(roi_rect.x as f32 + cx, roi_rect.y as f32 + cy));
+        }
+        
+        // 3×3二次曲面亚像素拟合
+        let (subx, suby) = Self::quadfit_subpixel_3x3(&dist, max_loc)?;
+        Ok(core::Point2f::new(roi_rect.x as f32 + subx, roi_rect.y as f32 + suby))
+    }
+    
+    /// 🚀 V3.1: 快速径向采样（降采样版本）
+    fn refine_dark_radial_fit_fast(
+        roi: &core::Mat,
+        roi_rect: core::Rect,
+        polar: &PolarTable,
+        rin: f32,
+        rout: f32,
+        r0: f32,
+        radial_step: f32,
+    ) -> Result<(bool, core::Point2f), opencv::Error> {
+        // Scharr梯度
+        let mut gx = core::Mat::default();
+        let mut gy = core::Mat::default();
+        imgproc::scharr(roi, &mut gx, core::CV_32F, 1, 0, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        imgproc::scharr(roi, &mut gy, core::CV_32F, 0, 1, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        
+        let mut mag = core::Mat::default();
+        core::magnitude(&gx, &gy, &mut mag)?;
+        
+        let cx = (roi.cols() as f32) * 0.5;
+        let cy = (roi.rows() as f32) * 0.5;
+        
+        let mut pts = Vec::<(f32, f32, f32)>::new(); // (x, y, w=grad)
+        
+        for k in 0..polar.n {
+            let (cs, sn) = (polar.cos[k], polar.sin[k]);
+            
+            // 沿半径采样，在[rin, rout]寻找最大梯度位置
+            let mut best = (0f32, 0f32, 0f32); // (x, y, mag)
+            let mut r = rin;
+            while r <= rout {
+                let x = cx + r * cs;
+                let y = cy + r * sn;
+                let g = Self::bilinear_at_f32(&mag, x, y)?; // 双线性取值
+                if g > best.2 {
+                    best = (x, y, g);
+                }
+                r += radial_step; // 使用传入的步长
+            }
+            if best.2 > 0.0 {
+                pts.push(best);
+            }
+        }
+        
+        // 覆盖度：≥150°且≥3个象限
+        if !Self::angle_coverage_ok(&pts, cx, cy) {
+            return Ok((false, core::Point2f::new(0.0, 0.0)));
+        }
+        
+        // Pratt/Taubin轻量拟合（权重=梯度）
+        if let Some((xc, yc, rad)) = Self::pratt_fit_weighted(&pts) {
+            if rad < 0.85 * r0 || rad > 1.15 * r0 {
+                return Ok((false, core::Point2f::new(0.0, 0.0)));
+            }
+            return Ok((true, core::Point2f::new(roi_rect.x as f32 + xc, roi_rect.y as f32 + yc)));
+        }
+        
+        Ok((false, core::Point2f::new(0.0, 0.0)))
+    }
+    
+    /// 🚀 V3: 低置信径向采样+轻量圆拟合（无contours，无Hough）
+    fn refine_dark_radial_fit(
+        roi: &core::Mat,
+        roi_rect: core::Rect,
+        polar: &PolarTable,
+        rin: f32,
+        rout: f32,
+        r0: f32,
+    ) -> Result<(bool, core::Point2f), opencv::Error> {
+        // 先算一次Scharr并缓存
+        let mut gx = core::Mat::default();
+        let mut gy = core::Mat::default();
+        imgproc::scharr(roi, &mut gx, core::CV_32F, 1, 0, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        imgproc::scharr(roi, &mut gy, core::CV_32F, 0, 1, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        
+        let mut mag = core::Mat::default();
+        core::magnitude(&gx, &gy, &mut mag)?;
+        
+        let cx = (roi.cols() as f32) * 0.5;
+        let cy = (roi.rows() as f32) * 0.5;
+        
+        let mut pts = Vec::<(f32, f32, f32)>::new(); // (x, y, w=grad)
+        
+        for k in 0..polar.n {
+            let (cs, sn) = (polar.cos[k], polar.sin[k]);
+            
+            // 沿半径采样，在[rin, rout]寻找最大梯度位置
+            let mut best = (0f32, 0f32, 0f32); // (x, y, mag)
+            let mut r = rin;
+            while r <= rout {
+                let x = cx + r * cs;
+                let y = cy + r * sn;
+                let g = Self::bilinear_at_f32(&mag, x, y)?; // 双线性取值
+                if g > best.2 {
+                    best = (x, y, g);
+                }
+                r += 0.6; // 步长~0.6px足够
+            }
+            if best.2 > 0.0 {
+                pts.push(best);
+            }
+        }
+        
+        // 覆盖度：≥150°且≥3个象限
+        if !Self::angle_coverage_ok(&pts, cx, cy) {
+            return Ok((false, core::Point2f::new(0.0, 0.0)));
+        }
+        
+        // Pratt/Taubin轻量拟合（权重=梯度）
+        if let Some((xc, yc, rad)) = Self::pratt_fit_weighted(&pts) {
+            if rad < 0.85 * r0 || rad > 1.15 * r0 {
+                return Ok((false, core::Point2f::new(0.0, 0.0)));
+            }
+            return Ok((true, core::Point2f::new(roi_rect.x as f32 + xc, roi_rect.y as f32 + yc)));
+        }
+        
+        Ok((false, core::Point2f::new(0.0, 0.0)))
+    }
+    
+    /// 🚀 V3: 双线性插值取值
+    fn bilinear_at_f32(mat: &core::Mat, x: f32, y: f32) -> Result<f32, opencv::Error> {
+        let x0 = x.floor() as i32;
+        let y0 = y.floor() as i32;
+        let x1 = x0 + 1;
+        let y1 = y0 + 1;
+        
+        // 边界检查
+        if x0 < 0 || y0 < 0 || x1 >= mat.cols() || y1 >= mat.rows() {
+            return Ok(0.0);
+        }
+        
+        let fx = x - x0 as f32;
+        let fy = y - y0 as f32;
+        
+        let f00 = *mat.at_2d::<f32>(y0, x0)?;
+        let f01 = *mat.at_2d::<f32>(y0, x1)?;
+        let f10 = *mat.at_2d::<f32>(y1, x0)?;
+        let f11 = *mat.at_2d::<f32>(y1, x1)?;
+        
+        let f0 = f00 * (1.0 - fx) + f01 * fx;
+        let f1 = f10 * (1.0 - fx) + f11 * fx;
+        let result = f0 * (1.0 - fy) + f1 * fy;
+        
+        Ok(result)
+    }
+    
+    /// 🚀 V3: 角覆盖度检查
+    fn angle_coverage_ok(pts: &[(f32, f32, f32)], cx: f32, cy: f32) -> bool {
+        if pts.len() < 20 {
+            return false;
+        }
+        
+        let mut angles: Vec<f32> = pts.iter()
+            .map(|(x, y, _)| (y - cy).atan2(x - cx))
+            .collect();
+        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        // 计算最大间隙
+        let mut max_gap = 0.0f32;
+        for i in 0..angles.len() {
+            let a = angles[i];
+            let b = if i + 1 < angles.len() {
+                angles[i + 1]
+            } else {
+                angles[0] + 2.0 * std::f32::consts::PI
+            };
+            let gap = (b - a).to_degrees();
+            if gap > max_gap {
+                max_gap = gap;
+            }
+        }
+        
+        let coverage = (360.0 - max_gap).max(0.0);
+        
+        // 象限覆盖检查
+        let mut quadrants = [false; 4];
+        for (x, y, _) in pts {
+            let dx = x - cx;
+            let dy = y - cy;
+            let quad = if dx >= 0.0 && dy >= 0.0 { 0 }
+                      else if dx < 0.0 && dy >= 0.0 { 1 }
+                      else if dx < 0.0 && dy < 0.0 { 2 }
+                      else { 3 };
+            quadrants[quad] = true;
+        }
+        let quad_count = quadrants.iter().filter(|&&x| x).count();
+        
+        coverage >= 150.0 && quad_count >= 3
+    }
+    
+    /// 🚀 V3: Pratt加权圆拟合
+    fn pratt_fit_weighted(pts: &[(f32, f32, f32)]) -> Option<(f32, f32, f32)> {
+        if pts.len() < 5 {
+            return None;
+        }
+        
+        // 简化实现：使用最小二乘法拟合圆
+        // 方程: (x-a)² + (y-b)² = r²
+        // 展开: x² + y² - 2ax - 2by + (a²+b²-r²) = 0
+        // 设 A = -2a, B = -2b, C = a²+b²-r²
+        // 则: x² + y² + Ax + By + C = 0
+        
+        let n = pts.len() as f32;
+        let mut sum_x = 0.0f32;
+        let mut sum_y = 0.0f32;
+        let mut sum_x2 = 0.0f32;
+        let mut sum_y2 = 0.0f32;
+        let mut sum_xy = 0.0f32;
+        let mut sum_x3 = 0.0f32;
+        let mut sum_y3 = 0.0f32;
+        let mut sum_x2y = 0.0f32;
+        let mut sum_xy2 = 0.0f32;
+        let mut sum_w = 0.0f32;
+        
+        for &(x, y, w) in pts {
+            let w = w.max(0.1); // 避免权重为0
+            sum_w += w;
+            sum_x += w * x;
+            sum_y += w * y;
+            sum_x2 += w * x * x;
+            sum_y2 += w * y * y;
+            sum_xy += w * x * y;
+            sum_x3 += w * x * x * x;
+            sum_y3 += w * y * y * y;
+            sum_x2y += w * x * x * y;
+            sum_xy2 += w * x * y * y;
+        }
+        
+        // 归一化
+        sum_x /= sum_w;
+        sum_y /= sum_w;
+        sum_x2 /= sum_w;
+        sum_y2 /= sum_w;
+        sum_xy /= sum_w;
+        sum_x3 /= sum_w;
+        sum_y3 /= sum_w;
+        sum_x2y /= sum_w;
+        sum_xy2 /= sum_w;
+        
+        // 构建线性方程组求解A, B
+        let m11 = sum_x2;
+        let m12 = sum_xy;
+        let m21 = sum_xy;
+        let m22 = sum_y2;
+        
+        let v1 = sum_x3 + sum_xy2;
+        let v2 = sum_y3 + sum_x2y;
+        
+        let det = m11 * m22 - m12 * m21;
+        if det.abs() < 1e-6 {
+            return None;
+        }
+        
+        let a = -(m22 * v1 - m12 * v2) / det / 2.0;
+        let b = -(m11 * v2 - m21 * v1) / det / 2.0;
+        
+        // 计算半径
+        let c = sum_x2 + sum_y2 + 2.0 * a * sum_x + 2.0 * b * sum_y;
+        let r_sq = a * a + b * b - c;
+        
+        if r_sq <= 0.0 {
+            return None;
+        }
+        
+        let r = r_sq.sqrt();
+        Some((a, b, r))
+    }
+    
+    /// 🔆 V3: DT初值 + 边界约束圆拟合 - 解决向阵列中心偏移 (已弃用，被精简版本替代)
+    #[allow(dead_code)]
+    fn refine_dt_with_boundary_fit(
+        roi: &core::Mat,
+        roi_rect: core::Rect,
+        original_center: core::Point2f,
+        r0: f32,        // 先验半径 ≈ D_nom/2
+        rin: f32,       // ~0.8 r0
+        rout: f32,      // ~1.25 r0
+    ) -> Result<core::Point2f, opencv::Error> {
+        let center_roi = core::Point::new(roi.cols() / 2, roi.rows() / 2);
+        
+        // A) 局部阈值 + 小修整，得到DT掩膜
+        let (binary, _t_local) = Self::dt_mask_from_local_threshold(roi, r0)?;
+        let mut dist = core::Mat::default();
+        imgproc::distance_transform(&binary, &mut dist, imgproc::DIST_L2, 3, core::CV_32F)?;
+        
+        // 在0.8*r0内找DT峰（初值）
+        let mut peak_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        let r_search = (0.8 * 0.9 * r0) as i32; // 稍微保守
+        imgproc::circle(&mut peak_mask, center_roi, r_search, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        
+        let mut min_v = 0.0;
+        let mut max_v = 0.0;
+        let mut min_l = core::Point::default();
+        let mut max_l = core::Point::default();
+        core::min_max_loc(&dist, Some(&mut min_v), Some(&mut max_v), Some(&mut min_l), Some(&mut max_l), &peak_mask)?;
+        
+        let c_dt = core::Point2f::new(max_l.x as f32 + 0.5, max_l.y as f32 + 0.5);
+        if max_v <= 2.0 {
+            // DT峰不可靠，直接回退
+            return Ok(original_center);
+        }
+        
+        // B) 角度采样找边（仅半环域；轻量）
+        let edge_pts = Self::radial_edge_points(roi, c_dt, rin, rout, 6.0)?; // 每6°取样
+        if edge_pts.len() < 20 {
+            // 边太弱，回退到DT
+            return Ok(core::Point2f::new(roi_rect.x as f32 + c_dt.x, roi_rect.y as f32 + c_dt.y));
+        }
+        
+        // 角覆盖检查（避免半边）
+        let ang_cov = Self::angular_coverage(&edge_pts, c_dt);
+        if ang_cov < 150.0 {
+            return Ok(core::Point2f::new(roi_rect.x as f32 + c_dt.x, roi_rect.y as f32 + c_dt.y));
+        }
+        
+        // C) 最小外接圆（近似鲁棒；已筛弱点）
+        let mut pts_i32 = core::Vector::<core::Point>::new();
+        for p in &edge_pts {
+            pts_i32.push(core::Point::new(p.x.round() as i32, p.y.round() as i32));
+        }
+        
+        let mut c_fit = core::Point2f::default();
+        let mut r_fit = 0.0f32;
+        imgproc::min_enclosing_circle(&pts_i32, &mut c_fit, &mut r_fit)?;
+        
+        // 半径/位移合理性
+        if r_fit < 0.85 * r0 || r_fit > 1.20 * r0 {
+            return Ok(core::Point2f::new(roi_rect.x as f32 + c_dt.x, roi_rect.y as f32 + c_dt.y));
+        }
+        
+        // 返回到全图坐标
+        Ok(core::Point2f::new(roi_rect.x as f32 + c_fit.x, roi_rect.y as f32 + c_fit.y))
+    }
+    
+    /// 🔧 V3: 局部阈值 + 小修整（DT掩膜）(已弃用)
+    #[allow(dead_code)]
+    fn dt_mask_from_local_threshold(
+        roi: &core::Mat,
+        r0: f32,
+    ) -> Result<(core::Mat, f64), opencv::Error> {
+        let center = core::Point::new(roi.cols() / 2, roi.rows() / 2);
+        
+        // 内盘/环域均值（与现有一致）
+        let mut in_mask = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut in_mask, center, (0.45 * r0 * 2.0) as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        let mu_in = core::mean(roi, &in_mask)?[0];
+        
+        let mut ring = core::Mat::zeros(roi.rows(), roi.cols(), core::CV_8U)?.to_mat()?;
+        imgproc::circle(&mut ring, center, (0.90 * r0 * 2.0) as i32, core::Scalar::all(255.0), -1, imgproc::LINE_8, 0)?;
+        imgproc::circle(&mut ring, center, (0.65 * r0 * 2.0) as i32, core::Scalar::all(0.0), -1, imgproc::LINE_8, 0)?;
+        let mu_ring = core::mean(roi, &ring)?[0];
+        
+        let t_local = mu_ring + 0.5 * (mu_in - mu_ring);
+        
+        let mut bin = core::Mat::default();
+        imgproc::threshold(roi, &mut bin, t_local, 255.0, imgproc::THRESH_BINARY)?;
+        
+        // 轻度形态学修整（让壳层更圆润，抑制DT偏移）
+        let se_size = ((0.06 * 2.0 * r0) as i32).max(3) | 1; // 确保奇数
+        let se_close = imgproc::get_structuring_element(
+            imgproc::MORPH_ELLIPSE,
+            core::Size::new(se_size, se_size),
+            core::Point::new(-1, -1)
+        )?;
+        let mut closed = core::Mat::default();
+        imgproc::morphology_ex(&bin, &mut closed, imgproc::MORPH_CLOSE, &se_close, 
+                              core::Point::new(-1, -1), 1, core::BORDER_CONSTANT, 
+                              imgproc::morphology_default_border_value()?)?;
+        
+        Ok((closed, t_local))
+    }
+    
+    /// 🔍 V3: 径向寻边 (已弃用)
+    #[allow(dead_code)]
+    fn radial_edge_points(
+        roi: &core::Mat,
+        c0: core::Point2f, // 初值中心（DT）
+        rin: f32,
+        rout: f32,
+        step_deg: f32,
+    ) -> Result<Vec<core::Point2f>, opencv::Error> {
+        // Sobel梯度
+        let mut gx = core::Mat::default();
+        let mut gy = core::Mat::default();
+        imgproc::sobel(roi, &mut gx, core::CV_32F, 1, 0, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        imgproc::sobel(roi, &mut gy, core::CV_32F, 0, 1, 3, 1.0, 0.0, core::BORDER_DEFAULT)?;
+        
+        let mut candidates = Vec::<(core::Point2f, f32, f32)>::new(); // (pt, grad_rad, theta)
+        
+        let mut theta = 0.0f32;
+        while theta < 360.0 {
+            let th = theta.to_radians();
+            let ux = th.cos();
+            let uy = th.sin();
+            
+            // 在[rin, rout]搜索径向最大梯度（方向与径向同向）
+            let mut best_g = 0.0f32;
+            let mut best_p = None::<core::Point2f>;
+            let mut r = rin;
+            while r <= rout {
+                let x = (c0.x + r * ux).round() as i32;
+                let y = (c0.y + r * uy).round() as i32;
+                if x >= 1 && x < roi.cols() - 1 && y >= 1 && y < roi.rows() - 1 {
+                    let gxv = *gx.at_2d::<f32>(y, x)?;
+                    let gyv = *gy.at_2d::<f32>(y, x)?;
+                    let g_rad = gxv * ux + gyv * uy; // 径向分量
+                    if g_rad > best_g {
+                        best_g = g_rad;
+                        best_p = Some(core::Point2f::new(x as f32, y as f32));
+                    }
+                }
+                r += 1.0;
+            }
+            
+            if let Some(p) = best_p {
+                candidates.push((p, best_g, theta));
+            }
+            theta += step_deg;
+        }
+        
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+        
+        // 以分位数去弱（Q70）
+        let mut gvals: Vec<f32> = candidates.iter().map(|(_, g, _)| *g).collect();
+        gvals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q70 = gvals[(0.7 * (gvals.len() - 1) as f32) as usize].max(1e-3);
+        
+        let mut pts = Vec::<core::Point2f>::new();
+        for (p, g, _) in candidates {
+            if g >= q70 {
+                pts.push(p);
+            }
+        }
+        Ok(pts)
+    }
+    
+    /// 📐 V3: 角覆盖度（避免单侧点）(已弃用)
+    #[allow(dead_code)]
+    fn angular_coverage(pts: &Vec<core::Point2f>, c: core::Point2f) -> f32 {
+        if pts.len() < 2 {
+            return 0.0;
+        }
+        let mut angs: Vec<f32> = pts.iter().map(|p| (p.y - c.y).atan2(p.x - c.x)).collect();
+        angs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        // 计算圆周上最大间隙，覆盖=360°-最大间隙
+        let mut max_gap = 0.0f32;
+        for i in 0..angs.len() {
+            let a = angs[i];
+            let b = if i + 1 < angs.len() {
+                angs[i + 1]
+            } else {
+                angs[0] + std::f32::consts::TAU
+            };
+            let gap = (b - a).to_degrees();
+            if gap > max_gap {
+                max_gap = gap;
+            }
+        }
+        (360.0 - max_gap).max(0.0)
+    }
+    
+    /// 🎨 V3: 绘制细化来源debug标记
+    fn draw_refine_debug(
+        dbg: &mut core::Mat,
+        pt: core::Point2f,
+        orig: core::Point2f,
+        tag: RefineTag,
+        scale_factor: f64
+    ) -> Result<(), opencv::Error> {
+        let (color, label) = match tag {
+            RefineTag::Hi => (core::Scalar::new(50.0, 220.0, 50.0, 0.0), "H"),      // 绿色 - 高置信
+            RefineTag::Lo => (core::Scalar::new(40.0, 180.0, 255.0, 0.0), "L"),     // 橙色 - 低置信
+            RefineTag::Fallback => (core::Scalar::new(30.0, 30.0, 255.0, 0.0), "F"), // 红色 - 回退
+        };
+        
+        let scaled_pt = core::Point::new(
+            (pt.x as f64 * scale_factor) as i32,
+            (pt.y as f64 * scale_factor) as i32
+        );
+        let scaled_orig = core::Point::new(
+            (orig.x as f64 * scale_factor) as i32,
+            (orig.y as f64 * scale_factor) as i32
+        );
+        
+        // 绘制细化来源标记圆
+        imgproc::circle(dbg, scaled_pt, (6.0 * scale_factor) as i32, color, 2, imgproc::LINE_8, 0)?;
+        
+        // 绘制标签
+        imgproc::put_text(dbg, label, 
+            core::Point::new(scaled_pt.x + 8, scaled_pt.y - 8),
+            imgproc::FONT_HERSHEY_SIMPLEX, 0.5 * scale_factor, color, 
+            std::cmp::max(1, (1.0 * scale_factor) as i32), imgproc::LINE_AA, false)?;
+        
+        // 绘制位移向量箭头
+        if (scaled_pt.x - scaled_orig.x).abs() > 1 || (scaled_pt.y - scaled_orig.y).abs() > 1 {
+            imgproc::arrowed_line(dbg, scaled_orig, scaled_pt, color, 
+                std::cmp::max(1, (1.0 * scale_factor) as i32), imgproc::LINE_AA, 0, 0.25)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Asymmetric Grid排序 (基于generate_world_points_from_list的坐标模式)
+    /// ⚠️ 注意：当前排序算法有索引越界问题，暂时跳过以专注于圆点检测优化
+    pub fn sort_asymmetric_grid(&self, centers: &mut core::Vector<core::Point2f>) -> Result<(), opencv::Error> {
+        if centers.len() != 40 {
+            println!("⚠️ 圆点数量不是40个，跳过排序 (当前: {}个)", centers.len());
+            return Ok(());
+        }
+        
+        println!("⚠️ 排序功能暂时跳过 - 专注于圆点检测优化");
+        println!("   当前检测到 {} 个圆点，排序算法待修复", centers.len());
+        
+        // TODO: 修复4行10列的asymmetric grid排序算法
+        // 当前算法存在索引越界问题，需要重新设计
+        // 正确的布局应该是：4行10列，而不是10行4列
+        
+        Ok(())
+    }
+    
+    /// 保存带标注的debug图像（支持缩放显示）
+    pub fn save_debug_image(
+        &self, 
+        image: &core::Mat, 
+        centers: &core::Vector<core::Point2f>, 
+        filename: &str
+    ) -> Result<(), opencv::Error> {
+        // 转换为彩色图像
+        let mut debug_image = core::Mat::default();
+        if image.channels() == 1 {
+            imgproc::cvt_color(image, &mut debug_image, imgproc::COLOR_GRAY2BGR, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
+        } else {
+            debug_image = image.clone();
+        }
+        
+        // 🎯 计算缩放比例 - 让图像更容易查看
+        let scale_factor = if debug_image.cols() > 1500 || debug_image.rows() > 1500 {
+            0.5 // 大图像缩放到50%
+        } else {
+            1.0 // 小图像保持原尺寸
+        };
+        
+        // 应用缩放
+        let mut scaled_image = core::Mat::default();
+        if scale_factor != 1.0 {
+            let new_size = core::Size::new(
+                (debug_image.cols() as f64 * scale_factor) as i32,
+                (debug_image.rows() as f64 * scale_factor) as i32,
+            );
+            imgproc::resize(&debug_image, &mut scaled_image, new_size, 0.0, 0.0, imgproc::INTER_LINEAR)?;
+        } else {
+            scaled_image = debug_image.clone();
+        }
+        
+        // 绘制检测到的圆点（根据缩放调整大小）
+        let circle_radius = (8.0 * scale_factor) as i32;
+        let font_scale = 0.6 * scale_factor;
+        let line_thickness = std::cmp::max(1, (2.0 * scale_factor) as i32);
+        
+        for i in 0..centers.len() {
+            let point = centers.get(i)?;
+            let scaled_x = (point.x as f64 * scale_factor) as i32;
+            let scaled_y = (point.y as f64 * scale_factor) as i32;
+            
+            // 绘制圆点 (绿色，更大更明显)
+            imgproc::circle(
+                &mut scaled_image,
+                core::Point::new(scaled_x, scaled_y),
+                circle_radius,
+                core::Scalar::new(0.0, 255.0, 0.0, 0.0), // 绿色
+                line_thickness,
+                imgproc::LINE_8,
+                0,
+            )?;
+            
+            // 绘制圆心十字标记 (红色)
+            let cross_size = circle_radius / 2;
+            imgproc::line(
+                &mut scaled_image,
+                core::Point::new(scaled_x - cross_size, scaled_y),
+                core::Point::new(scaled_x + cross_size, scaled_y),
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0), // 红色
+                line_thickness,
+                imgproc::LINE_8,
+                0,
+            )?;
+            imgproc::line(
+                &mut scaled_image,
+                core::Point::new(scaled_x, scaled_y - cross_size),
+                core::Point::new(scaled_x, scaled_y + cross_size),
+                core::Scalar::new(0.0, 0.0, 255.0, 0.0), // 红色
+                line_thickness,
+                imgproc::LINE_8,
+                0,
+            )?;
+            
+            // 添加序号标注 (蓝色，更大字体)
+            let text = format!("{}", i);
+            imgproc::put_text(
+                &mut scaled_image,
+                &text,
+                core::Point::new(scaled_x + circle_radius + 5, scaled_y - circle_radius - 5),
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                core::Scalar::new(255.0, 0.0, 0.0, 0.0), // 蓝色
+                line_thickness,
+                imgproc::LINE_8,
+                false,
+            )?;
+        }
+        
+        // 🎨 V3: 绘制细化来源标记
+        if let (Some(ref tags), Some(ref orig_centers)) = (&self.last_refine_tags, &self.last_original_centers) {
+            for i in 0..centers.len().min(tags.len()) {
+                let refined_pt = centers.get(i)?;
+                let orig_pt = orig_centers.get(i)?;
+                let tag = tags[i];
+                Self::draw_refine_debug(&mut scaled_image, refined_pt, orig_pt, tag, scale_factor)?;
+            }
+        }
+        
+        // 添加统计信息（根据缩放调整位置和大小）
+        let mut info_text = vec![
+            format!("Connected Components Detection (4-conn)"),
+            format!("Detected: {}/40 circles", centers.len()),
+            format!("Triangle: {:.1}, Hi: {:.1}, Lo: {:.1}", 
+                   self.triangle_threshold, self.high_threshold, self.low_threshold),
+            format!("Area: {:.0}-{:.0} px², Shape: AR={:.1}-{:.1}, Fill={:.2}-{:.2}", 
+                   self.min_area, self.max_area, self.aspect_ratio_min, self.aspect_ratio_max,
+                   self.fill_ratio_min, self.fill_ratio_max),
+            format!("Scale: {:.0}% ({}x{})", scale_factor * 100.0, scaled_image.cols(), scaled_image.rows()),
+        ];
+        
+        // 🎨 V3: 添加细化统计信息
+        if let Some(ref tags) = &self.last_refine_tags {
+            let hi_count = tags.iter().filter(|&&t| matches!(t, RefineTag::Hi)).count();
+            let lo_count = tags.iter().filter(|&&t| matches!(t, RefineTag::Lo)).count();
+            let fb_count = tags.iter().filter(|&&t| matches!(t, RefineTag::Fallback)).count();
+            info_text.push(format!("V3 Refine: H={} L={} F={}", hi_count, lo_count, fb_count));
+        }
+        
+        for (i, text) in info_text.iter().enumerate() {
+            imgproc::put_text(
+                &mut scaled_image,
+                text,
+                core::Point::new(10, 30 + i as i32 * (25.0 * scale_factor) as i32),
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                core::Scalar::new(0.0, 255.0, 255.0, 0.0), // 黄色
+                line_thickness,
+                imgproc::LINE_8,
+                false,
+            )?;
+        }
+        
+        // 保存图像
+        imgcodecs::imwrite(filename, &scaled_image, &core::Vector::<i32>::new())?;
+        println!("💾 已保存debug图像: {} (缩放: {:.0}%)", filename, scale_factor * 100.0);
+        
+        Ok(())
+    }
+}
+
+/// 测试主函数
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🚀 启动连通域圆点检测测试程序");
+    println!("📁 测试目录: C:\\Users\\Y000010\\MVS\\Data\\test_0822\\");
+    println!("🎯 测试范围: l_01.bmp~l_06.bmp, r_01.bmp~r_06.bmp");
+    println!("🔍 测试内容: 连通域+面积过滤圆点检测");
+    println!("{}", "=".repeat(60));
+    
+    let mut detector = ConnectedComponentsDetector::new();
+    let mut results = Vec::new();
+    
+    // 测试所有图像
+    for i in 1..=6 {
+        // 测试左图
+        let left_path = format!("C:\\Users\\Y000010\\MVS\\Data\\test_0822\\l_{:02}.bmp", i);
+        if Path::new(&left_path).exists() {
+            let left_name = format!("l_{:02}", i);
+            match test_single_image(&mut detector, &left_path, &left_name) {
+                Ok((count, time)) => {
+                    results.push((left_name, count, time, true));
+                }
+                Err(e) => {
+                    println!("❌ 测试失败 {}: {}", left_name, e);
+                    results.push((left_name, 0, 0, false));
+                }
+            }
+        }
+        
+        // 测试右图
+        let right_path = format!("C:\\Users\\Y000010\\MVS\\Data\\test_0822\\r_{:02}.bmp", i);
+        if Path::new(&right_path).exists() {
+            let right_name = format!("r_{:02}", i);
+            match test_single_image(&mut detector, &right_path, &right_name) {
+                Ok((count, time)) => {
+                    results.push((right_name, count, time, true));
+                }
+                Err(e) => {
+                    println!("❌ 测试失败 {}: {}", right_name, e);
+                    results.push((right_name, 0, 0, false));
+                }
+            }
+        }
+    }
+    
+    // 打印测试结果总结
+    print_test_summary(&results);
+    
+    println!("\n🎉 连通域圆点检测测试完成");
+    println!("请查看生成的cc_detection_*.png文件查看检测效果");
+    
+    Ok(())
+}
+
+/// 测试单张图像
+fn test_single_image(
+    detector: &mut ConnectedComponentsDetector,
+    image_path: &str,
+    image_name: &str,
+) -> Result<(usize, u128), Box<dyn std::error::Error>> {
+    println!("\n🔍 测试图像: {}", image_name);
+    
+    // 加载图像
+    let image = imgcodecs::imread(image_path, imgcodecs::IMREAD_GRAYSCALE)?;
+    if image.empty() {
+        return Err(format!("无法加载图像: {}", image_path).into());
+    }
+    
+    println!("   图像尺寸: {}×{}", image.cols(), image.rows());
+    
+    // 检测圆点
+    let start_time = Instant::now();
+    let mut centers = detector.detect_circles(&image)?;
+    let detection_time = start_time.elapsed();
+    
+    // 排序
+    detector.sort_asymmetric_grid(&mut centers)?;
+    
+    // 保存debug图像
+    let debug_filename = format!("cc_detection_{}_count{}.png", image_name, centers.len());
+    detector.save_debug_image(&image, &centers, &debug_filename)?;
+    
+    let count = centers.len();
+    let time_ms = detection_time.as_millis();
+    
+    println!("   ✅ 检测结果: {} 个圆点, 耗时: {} ms", count, time_ms);
+    
+    // 评估结果
+    if count == 40 {
+        println!("   🎯 完美检测!");
+    } else if count >= 35 {
+        println!("   ✅ 检测良好 (≥87.5%)");
+    } else if count >= 25 {
+        println!("   ⚠️ 检测一般 (≥62.5%)");
+    } else {
+        println!("   ❌ 检测不足 (<62.5%)");
+    }
+    
+    Ok((count, time_ms))
+}
+
+/// 打印测试结果总结
+fn print_test_summary(results: &[(String, usize, u128, bool)]) {
+    println!("\n📊 测试结果总结");
+    println!("{}", "=".repeat(70));
+    println!("图像名称 | 检测数量 | 耗时(ms) | 状态 | 评估");
+    println!("{}", "-".repeat(70));
+    
+    for (name, count, time, success) in results {
+        let status = if *success { "✅" } else { "❌" };
+        let evaluation = if *count == 40 {
+            "完美"
+        } else if *count >= 35 {
+            "良好"
+        } else if *count >= 25 {
+            "一般"
+        } else {
+            "不足"
+        };
+        
+        println!("{:8} | {:8} | {:8} | {:4} | {}", 
+                name, count, time, status, evaluation);
+    }
+    
+    // 统计分析
+    let successful_tests: Vec<_> = results.iter().filter(|(_, _, _, s)| *s).collect();
+    if !successful_tests.is_empty() {
+        let total_count: usize = successful_tests.iter().map(|(_, c, _, _)| c).sum();
+        let total_time: u128 = successful_tests.iter().map(|(_, _, t, _)| t).sum();
+        let avg_count = total_count as f64 / successful_tests.len() as f64;
+        let avg_time = total_time as f64 / successful_tests.len() as f64;
+        
+        let perfect_count = successful_tests.iter().filter(|(_, c, _, _)| *c == 40).count();
+        let good_count = successful_tests.iter().filter(|(_, c, _, _)| *c >= 35).count();
+        
+        println!("\n📈 统计分析:");
+        println!("  成功测试: {}/{}", successful_tests.len(), results.len());
+        println!("  平均检测: {:.1} 个圆点", avg_count);
+        println!("  平均耗时: {:.1} ms", avg_time);
+        println!("  完美检测: {} 个图像 (40/40)", perfect_count);
+        println!("  良好检测: {} 个图像 (≥35/40)", good_count);
+        
+        // 性能评估
+        if avg_time < 50.0 {
+            println!("  性能评估: ✅ 优秀 (<50ms, 目标达成!)");
+        } else if avg_time < 80.0 {
+            println!("  性能评估: ⚠️ 良好 (<80ms, 优于SBD)");
+        } else {
+            println!("  性能评估: ❌ 需要优化 (≥80ms)");
+        }
+        
+        // 检测评估
+        if avg_count >= 38.0 {
+            println!("  检测评估: ✅ 连通域方法优秀");
+        } else if avg_count >= 35.0 {
+            println!("  检测评估: ⚠️ 连通域方法良好，可进一步优化");
+        } else {
+            println!("  检测评估: ❌ 连通域方法需要调整参数");
+        }
+    }
+} 

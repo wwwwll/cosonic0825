@@ -1,0 +1,256 @@
+//! 性能监控集成测试
+//! 
+//! 测试内容：
+//! 1. 帧率控制功能
+//! 2. 性能统计准确性
+//! 3. 与触发模式的协同工作
+//! 4. 高负载场景模拟
+
+#[cfg(test)]
+mod tests {
+    use crate::camera_ffi::{CameraHandle, CameraPerformance, SystemStats, TriggerMode};
+    use std::thread;
+    use std::time::Duration;
+
+    /// 测试基本的帧率设置功能
+    #[test]
+    fn test_frame_rate_control() {
+        println!("🧪 测试帧率控制功能");
+        
+        // 测试不同帧率设置
+        let test_fps = vec![1, 5, 10, 15, 20, 30];
+        
+        for fps in test_fps {
+            let mut camera_perf = CameraPerformance::new(0);
+            camera_perf.target_fps = fps;
+            
+            // 模拟帧率更新
+            camera_perf.update(fps as f32, 0);
+            
+            assert_eq!(camera_perf.target_fps, fps);
+            assert_eq!(camera_perf.actual_fps, fps as f32);
+            assert!(camera_perf.is_healthy());
+            
+            println!("✅ {}fps 设置测试通过", fps);
+        }
+    }
+
+    /// 测试帧率准确性计算
+    #[test]
+    fn test_fps_accuracy_calculation() {
+        println!("🧪 测试帧率准确性计算");
+        
+        let mut camera_perf = CameraPerformance::new(0);
+        camera_perf.target_fps = 10;
+        
+        // 测试不同精度的帧率
+        let test_cases = vec![
+            (10.0, 100.0), // 完全准确
+            (9.9, 99.0),   // 轻微偏差
+            (9.0, 90.0),   // 较大偏差
+            (5.0, 50.0),   // 严重偏差
+        ];
+        
+        for (actual_fps, expected_accuracy) in test_cases {
+            camera_perf.update(actual_fps, 0);
+            let accuracy = camera_perf.get_accuracy_percentage();
+            
+            assert!((accuracy - expected_accuracy).abs() < 1.0, 
+                   "FPS: {}, Expected: {}, Got: {}", actual_fps, expected_accuracy, accuracy);
+            
+            println!("✅ FPS {:.1} -> 准确率 {:.1}%", actual_fps, accuracy);
+        }
+    }
+
+    /// 测试丢帧检测
+    #[test]
+    fn test_frame_drop_detection() {
+        println!("🧪 测试丢帧检测");
+        
+        let mut camera_perf = CameraPerformance::new(0);
+        camera_perf.target_fps = 10;
+        
+        // 模拟丢帧情况
+        camera_perf.update(8.5, 15); // 实际帧率偏低，有丢帧
+        
+        assert_eq!(camera_perf.frames_dropped, 15);
+        assert!(!camera_perf.is_healthy()); // 应该不健康
+        assert_eq!(camera_perf.status, "帧率偏低");
+        
+        println!("✅ 丢帧检测功能正常");
+    }
+
+    /// 测试系统整体统计
+    #[test]
+    fn test_system_stats() {
+        println!("🧪 测试系统整体统计");
+        
+        let mut system_stats = SystemStats::new();
+        
+        // 模拟正常运行状态
+        system_stats.update((10.0, 0), (10.0, 0));
+        assert!(system_stats.is_system_healthy());
+        assert_eq!(system_stats.system_status, "正常运行");
+        
+        // 模拟异常状态
+        system_stats.update((8.0, 5), (10.0, 0));
+        assert!(!system_stats.is_system_healthy());
+        assert_eq!(system_stats.system_status, "部分异常");
+        
+        // 模拟停止状态
+        system_stats.update((0.0, 0), (0.0, 0));
+        assert!(!system_stats.is_system_healthy());
+        assert_eq!(system_stats.system_status, "未运行");
+        
+        println!("✅ 系统统计功能正常");
+    }
+
+    /// 测试Display trait实现
+    #[test]
+    fn test_display_formatting() {
+        println!("🧪 测试Display格式化");
+        
+        let mut camera_perf = CameraPerformance::new(0);
+        camera_perf.target_fps = 10;
+        camera_perf.update(9.8, 2);
+        
+        let display_str = format!("{}", camera_perf);
+        assert!(display_str.contains("Camera 0"));
+        assert!(display_str.contains("Target: 10fps"));
+        assert!(display_str.contains("Actual: 9.80fps"));
+        assert!(display_str.contains("Dropped: 2"));
+        
+        println!("✅ Display格式化: {}", display_str);
+    }
+
+    /// 测试序列化功能
+    #[test]
+    fn test_serialization() {
+        println!("🧪 测试序列化功能");
+        
+        let mut system_stats = SystemStats::new();
+        system_stats.update((10.0, 0), (9.5, 1));
+        
+        // 测试JSON序列化
+        let json = serde_json::to_string(&system_stats).unwrap();
+        assert!(json.contains("left_camera"));
+        assert!(json.contains("right_camera"));
+        assert!(json.contains("system_status"));
+        
+        // 测试反序列化
+        let deserialized: SystemStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.left_camera.actual_fps, 10.0);
+        assert_eq!(deserialized.right_camera.frames_dropped, 1);
+        
+        println!("✅ JSON序列化/反序列化正常");
+    }
+
+    /// 模拟高负载场景测试
+    #[test]
+    fn test_high_load_scenario() {
+        println!("🧪 模拟高负载场景测试");
+        
+        let mut system_stats = SystemStats::new();
+        
+        // 模拟高频更新
+        for i in 0..100 {
+            let left_fps = 10.0 + (i as f32 % 10.0) / 10.0; // 轻微波动
+            let right_fps = 10.0 - (i as f32 % 5.0) / 10.0;
+            let dropped = i % 3; // 偶尔丢帧
+            
+            system_stats.update((left_fps, dropped), (right_fps, dropped));
+            
+            // 每10次检查一次状态
+            if i % 10 == 0 {
+                assert!(system_stats.timestamp > 0);
+                println!("  第{}次更新: {}", i, system_stats.system_status);
+            }
+        }
+        
+        println!("✅ 高负载场景测试完成");
+    }
+
+    /// 边界条件测试
+    #[test]
+    fn test_boundary_conditions() {
+        println!("🧪 测试边界条件");
+        
+        let mut camera_perf = CameraPerformance::new(0);
+        
+        // 测试极端帧率
+        camera_perf.target_fps = 1;
+        camera_perf.update(1.0, 0);
+        assert!(camera_perf.is_healthy());
+        
+        camera_perf.target_fps = 30;
+        camera_perf.update(30.0, 0);
+        assert!(camera_perf.is_healthy());
+        
+        // 测试零帧率
+        camera_perf.update(0.0, 0);
+        assert!(!camera_perf.is_healthy());
+        assert_eq!(camera_perf.status, "未运行");
+        
+        // 测试准确率计算边界
+        camera_perf.target_fps = 0;
+        assert_eq!(camera_perf.get_accuracy_percentage(), 0.0);
+        
+        println!("✅ 边界条件测试通过");
+    }
+
+    /// 集成测试：模拟完整工作流程
+    #[test] 
+    fn test_integration_workflow() {
+        println!("🧪 集成测试：完整工作流程");
+        
+        let mut system_stats = SystemStats::new();
+        
+        // 阶段1：初始化
+        println!("  阶段1：系统初始化");
+        assert_eq!(system_stats.system_status, "初始化中");
+        
+        // 阶段2：预览模式（10fps）
+        println!("  阶段2：预览模式 10fps");
+        system_stats.left_camera.target_fps = 10;
+        system_stats.right_camera.target_fps = 10;
+        system_stats.update((10.0, 0), (10.0, 0));
+        assert_eq!(system_stats.system_status, "正常运行");
+        
+        // 阶段3：检测模式（软触发，帧率可能不稳定）
+        println!("  阶段3：检测模式（软触发）");
+        system_stats.update((8.5, 2), (9.0, 1));
+        assert_eq!(system_stats.system_status, "部分异常");
+        
+        // 阶段4：合像模式（高精度同步）
+        println!("  阶段4：合像模式（高精度）");
+        system_stats.update((10.0, 0), (10.0, 0));
+        assert_eq!(system_stats.system_status, "正常运行");
+        
+        println!("✅ 完整工作流程集成测试通过");
+    }
+}
+
+// 性能基准测试（仅在benchmark feature下编译）
+#[cfg(all(test, feature = "benchmark"))]
+mod benchmarks {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn benchmark_stats_update() {
+        let mut system_stats = SystemStats::new();
+        let iterations = 10000;
+        
+        let start = Instant::now();
+        for i in 0..iterations {
+            system_stats.update((10.0 + i as f32 % 1.0, i % 10), (9.8 + i as f32 % 0.5, i % 5));
+        }
+        let duration = start.elapsed();
+        
+        println!("📊 性能基准：{}次更新耗时 {:?} (平均 {:.2}μs/次)", 
+                iterations, duration, duration.as_micros() as f64 / iterations as f64);
+        
+        // 确保性能在合理范围内（每次更新应该小于100μs）
+        assert!(duration.as_micros() / iterations < 100);
+    }
+} 
